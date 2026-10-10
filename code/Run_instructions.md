@@ -4,7 +4,7 @@
 
 - Python 3.11 virtual environment
 - Docker with Compose
-- Data files in data/airbnb_milan
+- Trading Data files in `data/`
 - The Flink Kafka connector jar is downloaded automatically when the worker starts if it is missing.
 - If you run without internet access, set FLINK_KAFKA_CONNECTOR_JAR to a local jar path.
 
@@ -28,11 +28,11 @@ python -m pip install -r code/requirements.txt
 
 The repository does not need to keep the Kafka connector jars checked in.
 
-## Terminal 1 - Start Infrastructure
+## Terminal 1 - Start Local Infrastructure
 
 ```bash
 cd code
-docker compose up -d
+docker compose up -d kafka flink-jobmanager flink-taskmanager
 docker compose ps
 ```
 
@@ -41,12 +41,12 @@ docker compose ps
 ```bash
 source .venv311/bin/activate
 
-PYTHONPATH=code python code/mysimbdp/streamworker.py \
+PYTHONPATH=code/Pipeline python code/Pipeline/streamworker.py \
   --engine flink \
-  --cassandra-hosts localhost \
-  --consumer-group streamworker_group \
-  --input-topics tenant_a_events \
-  --starting-offsets latest
+  --consumer-group trading-flink-transport \
+  --input-topics trading-events \
+  --starting-offsets earliest \
+  --parallelism 1
 ```
 
 ## Terminal 3 - Produce Events
@@ -54,29 +54,32 @@ PYTHONPATH=code python code/mysimbdp/streamworker.py \
 ```bash
 source .venv311/bin/activate
 
-PYTHONPATH=code python code/mysimbdp/producer.py \
-  --tenant tenant_a \
-  --topic tenant_a_events \
-  --files data/airbnb_milan/listings.csv \
-  --subset 100 \
-  --rate 200 \
-  --event-time-source produced_at
+PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
+  --topic trading-events \
+  --files data/debs2022-gc-trading-day-08-11-21.csv \
+  --max-rows 1000 \
+  --rate 0
+
+# For a larger replay, use --subset 1. It scans the full file first and is
+# intentionally slow at a positive --rate.
 ```
 
-## Terminal 4 - Verify Cassandra Outputs
+## Terminal 4 - Verify Kafka and Flink Logs
+
+Kafka keeps records from previous runs. For a clean smoke test, use a new
+topic name consistently in the producer and stream worker commands, or delete
+the old topic before restarting the test. The existing `trading-events` topic
+may contain records produced before the CSV parser was corrected.
 
 ```bash
-docker exec -it cassandra cqlsh -e "SELECT COUNT(*) FROM stream_analytics.raw_events;"
-docker exec -it cassandra cqlsh -e "SELECT COUNT(*) FROM stream_analytics.window_results;"
-docker exec -it cassandra cqlsh -e "SELECT tenant_id, window_start, window_end, group_key, group_value, event_count, avg_price FROM stream_analytics.window_results LIMIT 20;"
-docker exec -it cassandra cqlsh -e "SELECT tenant_id, event_time, event_key, group_key, group_value, price FROM stream_analytics.raw_events LIMIT 20;"
-docker exec -it cassandra cqlsh -e "SELECT SUM(event_count) FROM stream_analytics.window_results;"
+docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic trading-events --from-beginning --max-messages 5
+tail -n 30 code/logs/streamworker_*.log
 ```
 
 ## Optional - Check Output Logs
 
 ```bash
-ls -lah logs
-tail -n 30 logs/tenant_a_results.log
-tail -n 30 logs/tenant_a_monitoring.log
+ls -lah code/logs
 ```

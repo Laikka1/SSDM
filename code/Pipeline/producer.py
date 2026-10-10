@@ -13,11 +13,11 @@ import pandas as pd
 from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mysimbdp.utils import get_json_logger
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils import get_json_logger, safe_json_dumps
 
 _running = True
-SUPPORTED_TENANT = "tenant_a"
+DEFAULT_TOPIC = "trading-events"
 
 
 def _handle_sigint(signum, frame):
@@ -35,34 +35,37 @@ def delivery_callback(err, msg):
         print(f"Message delivery failed: {err}", file=sys.stderr)
 
 
-def derive_record_type(filepath: str) -> str:
-    """Derive _record_type from the filename (first token of stem, lowercased)."""
-    stem = os.path.basename(filepath).split(".")[0].lower()
-    return stem.split("_")[0] if "_" in stem else stem
+def _first_value(record: dict, names: tuple[str, ...]):
+    for name in names:
+        if name in record and record[name] not in (None, ""):
+            return record[name]
+    return None
+
+
+def _symbol_key(record: dict, fallback: str) -> str:
+    value = _first_value(record, ("ID.[Exchange]", "ID", "id", "symbol"))
+    return str(value).strip() if value not in (None, "") else fallback
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Publish CSV rows to a Kafka topic"
-    )
-    parser.add_argument(
-        "--tenant",
-        "-n",
-        required=True,
-        choices=[SUPPORTED_TENANT],
-        help="Tenant identifier (tenant_a only)",
+        description="Publish Trading Data CSV rows to Kafka"
     )
     parser.add_argument("--files", "-f", nargs="+", required=True,
-                        help="One or more paths to CSV files (.csv.gz or .csv)")
-    parser.add_argument("--topic", "-t", required=True, help="Kafka topic name")
+                        help="One or more Trading Data CSV paths")
+    parser.add_argument("--topic", "-t", default=DEFAULT_TOPIC, help="Kafka topic name")
     parser.add_argument("--broker", "-b", default="localhost:9092", help="Kafka broker address")
     parser.add_argument(
         "--subset", "-s", type=float, default=100.0,
         help=(
-            "Testing convenience: percentage of total rows to use as a row cap "
+            "Testing convenience: percentage of rows to publish per file "
             "(0 < x <= 100). At 100 (default) no cap is applied and all rows from "
             "the provided files are emitted."
         ),
+    )
+    parser.add_argument(
+        "--max-rows", type=int, default=None,
+        help="Maximum rows to publish per file; skips the full-file subset scan",
     )
     parser.add_argument("--chunksize", "-c", type=int, default=500)
     parser.add_argument(
@@ -70,15 +73,6 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Target rows to produce per second "
             "(default: 200 for steadier streaming simulation; 0 = burst mode)."
-        ),
-    )
-    parser.add_argument(
-        "--event-time-source",
-        choices=["produced_at", "last_review", "last_review_or_produced_at"],
-        default="produced_at",
-        help=(
-            "Compatibility option. Event time is always set to produced_at "
-            "in the current implementation."
         ),
     )
     return parser.parse_args()
@@ -91,7 +85,7 @@ def ensure_topic_exists(broker: str, topic: str, logger) -> None:
         return
 
     futures = admin.create_topics(
-        [NewTopic(topic=topic, num_partitions=1, replication_factor=1)],
+        [NewTopic(topic=topic, num_partitions=3, replication_factor=1)],
         request_timeout=15,
     )
 
@@ -119,15 +113,23 @@ def main():
     if args.chunksize < 1:
         print(f"ERROR: --chunksize must be >= 1, got {args.chunksize}", file=sys.stderr)
         sys.exit(1)
+    if args.max_rows is not None and args.max_rows < 1:
+        print(f"ERROR: --max-rows must be >= 1, got {args.max_rows}", file=sys.stderr)
+        sys.exit(1)
 
-    logger = get_json_logger("producer", args.tenant)
+    logger = get_json_logger("producer", "trading")
 
     max_rows_per_file: dict[str, int] = {}
-    if args.subset < 100.0:
+    if args.max_rows is not None:
+        max_rows_per_file = {filepath: args.max_rows for filepath in args.files}
+        logger.info(f"Testing mode: max_rows={args.max_rows} per file")
+    elif args.subset < 100.0:
         for f in args.files:
             file_total = sum(
                 len(chunk)
-                for chunk in pd.read_csv(f, chunksize=args.chunksize, usecols=[0])
+                for chunk in pd.read_csv(
+                    f, chunksize=args.chunksize, usecols=[0], comment="#", index_col=False
+                )
             )
             max_rows_per_file[f] = math.ceil(file_total * args.subset / 100)
         logger.info(
@@ -136,18 +138,14 @@ def main():
         )
     
     logger.info(
-        f"Starting producer for {args.tenant} → {args.topic} ({len(args.files)} file(s))"
+        f"Starting Trading Data producer -> {args.topic} ({len(args.files)} file(s))"
     )
-    if args.event_time_source != "produced_at":
-        logger.warning(
-            "Ignoring --event-time-source; event_time is fixed to produced_at"
-        )
-    logger.info("event_time_source=fixed_produced_at")
 
     # Create Kafka producer
     prod_conf = {
         "bootstrap.servers": args.broker,
-        "client.id": f"producer_{args.tenant}_{args.topic}",
+        "client.id": f"trading-producer_{args.topic}",
+        "acks": "all",
         "message.send.max.retries": 5,
         "retry.backoff.ms": 50,
         "request.timeout.ms": 30000,
@@ -180,15 +178,15 @@ def main():
         # ── Process each file sequentially ──
         for file_index, filepath in enumerate(args.files, start=1):
             source_file = os.path.basename(filepath)
-            record_type = derive_record_type(filepath)
-
             file_rows_sent = 0
             file_max_rows = max_rows_per_file.get(filepath)
-            reader = pd.read_csv(filepath, chunksize=args.chunksize)
+            reader = pd.read_csv(
+                filepath, chunksize=args.chunksize, comment="#", index_col=False
+            )
 
             for chunk_num, chunk in enumerate(reader):
                 # Replace NaN with None — vectorised
-                chunk = chunk.where(chunk.notna(), None)
+                chunk = chunk.astype(object).where(pd.notna(chunk), None)
                 records = chunk.to_dict("records")
 
                 cap_reached = False
@@ -205,27 +203,25 @@ def main():
                         break
 
                     produced_at = datetime.now(timezone.utc).isoformat()
-                    event_key = str(record.get("id") or record.get("host_id") or file_rows_sent)
-                    partition_key = str(record.get("neighbourhood") or record.get("room_type") or event_key)
-                    event_time = produced_at
+                    row_number = file_rows_sent + 1
+                    event_key = f"{source_file}:{row_number}"
+                    symbol = _symbol_key(record, event_key)
 
                     envelope = {
-                        "tenant_id": args.tenant,
                         "event_key": event_key,
-                        "partition_key": partition_key,
-                        "event_time": str(event_time),
+                        "symbol": symbol,
                         "payload": record,
                         "_source_file": source_file,
-                        "_record_type": record_type,
+                        "_source_row": row_number,
                         "_produced_at": produced_at,
                     }
 
-                    payload = json.dumps(envelope, default=str).encode("utf-8")
+                    payload = safe_json_dumps(envelope).encode("utf-8")
                     while _running:
                         try:
                             producer.produce(
                                 args.topic,
-                                key=args.tenant.encode("utf-8"),
+                                key=symbol.encode("utf-8"),
                                 value=payload,
                                 callback=delivery_callback,
                             )
@@ -240,7 +236,7 @@ def main():
 
                 logger.info(
                     f"[file {file_index}/{total_files}] {source_file}  chunk {chunk_num + 1}: "
-                    f"{file_rows_sent} rows sent so far  [record_type={record_type}]"
+                    f"{file_rows_sent} rows sent so far"
                 )
 
                 if cap_reached:

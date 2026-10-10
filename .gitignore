@@ -25,6 +25,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+data/
+*.csv
 
 # PyInstaller
 #   Usually these files are written by a python script from a template
@@ -153,11 +155,13 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv311/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+code/logs/
 
 # Spyder project settings
 .spyderproject
