@@ -28,6 +28,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--starting-offsets", choices=["latest", "earliest"], default="latest")
     parser.add_argument("--parallelism", type=int, default=1)
     parser.add_argument("--engine", choices=["flink"], default="flink")
+    parser.add_argument("--dead-letter-topic", default="trading-events-dead-letter")
+    parser.add_argument("--late-topic", default="trading-events-late")
+    parser.add_argument("--window-topic", default="trading-events-windows")
+    parser.add_argument("--normalized-topic", default="trading-events-normalized")
+    parser.add_argument("--housekeeping-topic", default="trading-events-housekeeping")
+    parser.add_argument("--lateness-seconds", type=int, default=300)
     return parser.parse_args()
 
 
@@ -75,12 +81,24 @@ def main() -> None:
     args = parse_args()
     if args.parallelism < 1:
         raise SystemExit("--parallelism must be at least 1")
+    if args.lateness_seconds < 0:
+        raise SystemExit("--lateness-seconds must not be negative")
 
     logger = get_json_logger("streamworker", "trading")
     topics = [topic.strip() for topic in args.input_topics.split(",") if topic.strip()]
     if not topics:
         raise SystemExit("--input-topics must contain at least one topic")
-    ensure_topics(args.broker, topics, logger)
+    ensure_topics(
+        args.broker,
+        topics + [
+            args.dead_letter_topic,
+            args.late_topic,
+            args.window_topic,
+            args.normalized_topic,
+            args.housekeeping_topic,
+        ],
+        logger,
+    )
     connector_jar = ensure_connector_jar(logger)
 
     from streamworker_flink import run_flink_worker

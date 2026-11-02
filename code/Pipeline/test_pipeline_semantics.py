@@ -1,0 +1,93 @@
+import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from normalization import normalize_envelope
+from trading_events import NormalizedEvent, Rejection
+from validation import validate_event
+from windowing import build_window_result, window_bounds
+
+
+def envelope(**payload):
+    return {
+        "event_key": "sample.csv:1",
+        "symbol": payload.get("ID.[Exchange]", "ABC.FR"),
+        "payload": {
+            "ID.[Exchange]": payload.get("ID.[Exchange]", "ABC.FR"),
+            "SecType": payload.get("SecType", "E"),
+            "Date": payload.get("Date", "08-11-2021"),
+            "Time": payload.get("Time", "00:05:00.000"),
+            **payload,
+        },
+        "_source_file": "sample.csv",
+        "_source_row": 1,
+        "_produced_at": "2021-11-08T00:00:00+00:00",
+    }
+
+
+class PipelineSemanticsTests(unittest.TestCase):
+    def test_normalizes_exchange_timezone_and_trade(self):
+        result = normalize_envelope(envelope(Last="12.5"))
+        self.assertIsInstance(result, NormalizedEvent)
+        self.assertEqual(result.event_type, "trade")
+        self.assertEqual(result.event_time.tzinfo, ZoneInfo("Europe/Paris"))
+        self.assertEqual(result.last_price, 12.5)
+
+    def test_classifies_multiple_attributes_as_one_event(self):
+        result = normalize_envelope(envelope(Ask="10", Bid="9"))
+        self.assertIsInstance(result, NormalizedEvent)
+        self.assertEqual(result.event_type, "quote")
+        self.assertEqual(result.available_attributes, ("ask", "bid"))
+
+        result = normalize_envelope(envelope(Ask="10", Bid="9", Last="8"))
+        self.assertIsInstance(result, NormalizedEvent)
+        self.assertEqual(result.event_type, "trade")
+        self.assertEqual(result.last_price, 8.0)
+
+    def test_rejects_invalid_price(self):
+        result = normalize_envelope(envelope(Last="not-a-price"))
+        self.assertIsInstance(result, Rejection)
+        self.assertEqual(result.reason_code, "invalid_numeric_value")
+
+        result = normalize_envelope(envelope(Last="0"))
+        self.assertIsInstance(result, NormalizedEvent)
+        self.assertEqual(result.event_type, "housekeeping")
+        self.assertIsNone(result.last_price)
+
+    def test_validation_requires_trade_price(self):
+        event = normalize_envelope(envelope())
+        self.assertIsInstance(event, NormalizedEvent)
+        self.assertIsNone(validate_event(event))
+
+    def test_window_exact_boundary_and_midnight(self):
+        midnight = datetime(2021, 11, 8, 0, 0, tzinfo=ZoneInfo("Europe/Paris"))
+        self.assertEqual(window_bounds(midnight), (midnight, datetime(2021, 11, 8, 0, 5, tzinfo=midnight.tzinfo)))
+        boundary = datetime(2021, 11, 8, 0, 5, tzinfo=ZoneInfo("Europe/Paris"))
+        start, end = window_bounds(boundary)
+        self.assertEqual(start, boundary)
+        self.assertEqual((end - start).total_seconds(), 300)
+
+    def test_window_result_counts_event_types_and_prices(self):
+        first = normalize_envelope(envelope(Last="12.5"))
+        second = normalize_envelope(envelope(Time="00:06:00.000"))
+        self.assertIsInstance(first, NormalizedEvent)
+        self.assertIsInstance(second, NormalizedEvent)
+        result = build_window_result([first, second])
+        self.assertEqual(result["event_count"], 2)
+        self.assertEqual(result["event_type_counts"], {"trade": 1, "housekeeping": 1})
+        self.assertEqual(result["valid_price_count"], 1)
+        self.assertEqual(result["last_trade_price"], 12.5)
+        self.assertIsNotNone(result["last_trade_event_time"])
+
+    def test_window_result_uses_latest_trade_not_latest_event(self):
+        early_trade = normalize_envelope(envelope(Time="00:05:01.000", Last="12.5"))
+        later_housekeeping = normalize_envelope(envelope(Time="00:05:02.000"))
+        self.assertIsInstance(early_trade, NormalizedEvent)
+        self.assertIsInstance(later_housekeeping, NormalizedEvent)
+        result = build_window_result([early_trade, later_housekeeping])
+        self.assertEqual(result["event_count"], 2)
+        self.assertEqual(result["last_trade_price"], 12.5)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -2,7 +2,7 @@
 
 ## 1. Scope and requirements
 
-This document describes the architecture for the CS-E4780 course project,
+This document describes the architecture for the course project,
 Detecting Trading Trends in Financial Tick Data. It is a design document only;
 it does not implement the proposed system.
 
