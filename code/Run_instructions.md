@@ -29,13 +29,16 @@ python -m pip install -r code/requirements.txt
 
 The repository does not need to keep the Kafka connector jars checked in.
 
-## Terminal 1 - Start local infrastructure
+## Terminal 1 - Start Kafka
 
 ```bash
 cd code
-docker compose up -d kafka flink-jobmanager flink-taskmanager
+docker compose up -d kafka
 docker compose ps
 ```
+
+The current worker uses a local PyFlink MiniCluster, so the Docker Flink
+JobManager and TaskManager are not required.
 
 The worker creates these topics automatically:
 
@@ -48,16 +51,26 @@ The worker creates these topics automatically:
 | `trading-events-normalized` | All valid normalized events, including housekeeping |
 | `trading-events-housekeeping` | Valid housekeeping/initialization events |
 
+The current Python worker runs the Flink job locally, so both Kafka addresses
+must use the host-published Kafka port:
+
+```bash
+--broker localhost:9092 --flink-broker localhost:9092
+```
+
 ## Terminal 2 - Start the Flink worker
 
-Run this from the repository root:
+Run this from the repository root. Keep this terminal running for the full
+replay:
 
 ```bash
 source .venv311/bin/activate
 
 PYTHONPATH=code/Pipeline python code/Pipeline/streamworker.py \
   --engine flink \
-  --consumer-group trading-flink-preparation \
+  --broker localhost:9092 \
+  --flink-broker localhost:9092 \
+  --consumer-group trading-flink-preparation-run2 \
   --input-topics trading-events \
   --starting-offsets earliest \
   --parallelism 1 \
@@ -66,7 +79,8 @@ PYTHONPATH=code/Pipeline python code/Pipeline/streamworker.py \
   --window-topic trading-events-windows \
   --normalized-topic trading-events-normalized \
   --housekeeping-topic trading-events-housekeeping \
-  --lateness-seconds 3600
+  --lateness-seconds 60 \
+  --progress-file code/logs/streamworker_progress.jsonl
 ```
 
 `--lateness-seconds 300` configures the bounded out-of-orderness watermark.
@@ -76,6 +90,28 @@ It is not replaced with processing time. Events that arrive after the
 watermark are routed to the late-event topic; the window operator does not
 reopen an already emitted window.
 
+The worker writes its startup configuration, a liveness heartbeat every 15
+seconds, normalization totals, analytical totals with the current event-time
+watermark, completed-window totals, and Flink stage lifecycle to a timestamped
+`code/logs/streamworker_*.log` file. It also creates/appends
+`code/logs/EMA.log` at startup; completed windows are recorded there with their
+symbol, close, EMA38, and EMA100 values.
+
+Progress is exchanged from the local Flink Python operators through
+`code/logs/streamworker_progress.jsonl` and aggregated by the host worker.
+Each progress line reports received, normalized, valid, rejected, analytical,
+late, and completed-window totals plus the current watermark. Kafka sink
+retries and a bounded Flink restart strategy handle transient broker
+disconnects; unrecoverable failures are logged with their root exception.
+
+Keep the worker terminal running while records are processed. To follow the
+worker and progress logs from another terminal:
+
+```bash
+tail -f code/logs/streamworker_*.log
+tail -f code/logs/streamworker_progress.jsonl
+```
+
 ## Terminal 3 - Produce a replay
 
 ```bash
@@ -84,17 +120,17 @@ source .venv311/bin/activate
 PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
   --topic trading-events \
   --files data/debs2022-gc-trading-day-08-11-21.csv \
-  --max-rows 10000 \
-  --rate 300
+  --max-rows 200000 \
+  --rate 1000
 
 # For a larger replay, omit --max-rows or use --subset 1.
 # A positive --rate intentionally throttles the replay.
 ```
 
-For a clean test, use a new input topic in both the worker and producer
-commands, or remove/reset the old Kafka topics. With
-`--starting-offsets earliest`, the worker reads all records available in the
-consumer group from the beginning.
+For a clean replay, use a new consumer group, for example
+`trading-flink-preparation-run2`, or use a new input topic in both commands.
+With `--starting-offsets earliest`, the worker reads all records available to
+that consumer group from the beginning.
 
 ## Terminal 4 - Verify results
 
@@ -118,7 +154,31 @@ docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --topic trading-events-windows --from-beginning --max-messages 5
 
 tail -n 50 code/logs/streamworker_*.log
+tail -n 50 code/logs/EMA.log
 ```
+
+### Inspect Kafka topic counts
+
+Check topic names and partition counts:
+
+```bash
+docker exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list
+
+for topic in trading-events trading-events-normalized \
+  trading-events-housekeeping trading-events-dead-letter \
+  trading-events-late trading-events-windows; do
+  echo "=== $topic ==="
+  docker exec kafka /opt/kafka/bin/kafka-get-offsets.sh \
+    --bootstrap-server localhost:9092 \
+    --topic "$topic"
+done
+```
+
+The `kafka-get-offsets.sh` output shows the latest offset for each partition.
+Sum the partition offsets to estimate the number of records available. The
+worker's streamworker log reports analytical records every 1,000 records and
+includes the current event-time watermark.
 
 ### How to interpret the output
 
@@ -160,8 +220,9 @@ tail -n 50 code/logs/streamworker_*.log
   rejected with a reason code.
 
 The worker log records the configured topics, parallelism, connector, and
-lateness bound. Flink's metric group contains counters for received,
-normalized, valid, rejected, late, event-type, exchange, and missing/invalid
-price records. For a small replay, compare the number and contents of
+lateness bound. Its consolidated progress lines contain counters for received,
+normalized, valid, rejected, analytical, late, and completed-window records,
+plus the current event-time watermark. Flink's metric group also contains
+counters for event type, exchange, and missing/invalid price records. For a small replay, compare the number and contents of
 window records against the CSV rows grouped by exchange-qualified symbol and
 five-minute local event-time interval.

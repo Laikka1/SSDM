@@ -2,37 +2,57 @@
 
 import json
 import sys
+import time
 from datetime import datetime, timezone
 
 from utils import safe_json_dumps
 
 
-def run_flink_worker(args, connector_jar: str, logger) -> None:
+def run_flink_worker(
+    args, connector_jar: str, logger, progress_file: str, run_id: str
+) -> None:
     """Run normalization, validation, event-time windows, and Kafka boundaries."""
     try:
         from pyflink.common import Duration, Time, Types, WatermarkStrategy
+        from pyflink.common.restart_strategy import RestartStrategies
         from pyflink.common.serialization import SimpleStringSchema
         from pyflink.datastream import OutputTag, StreamExecutionEnvironment
         from pyflink.datastream.connectors.kafka import KafkaOffsetsInitializer, KafkaSource
         from pyflink.datastream.connectors.kafka import KafkaSink, KafkaRecordSerializationSchema
         from pyflink.common.watermark_strategy import TimestampAssigner
         from pyflink.datastream.functions import (
+            KeyedProcessFunction,
             ProcessFunction,
             ProcessWindowFunction,
             RuntimeContext,
         )
         from pyflink.datastream.window import TumblingEventTimeWindows
     except Exception as exc:
-        logger.error("Flink runtime unavailable", extra={"extra": {"error": str(exc)}})
+        logger.error(
+            "Flink runtime unavailable",
+            extra={"extra": {"error_type": type(exc).__name__, "error": str(exc)}},
+        )
         raise RuntimeError("Install apache-flink in the Python 3.11 environment") from exc
 
     from normalization import normalize_envelope
+    from ema import create_ema_calculation
     from trading_events import NormalizedEvent, Rejection
     from validation import to_dead_letter, validate_event
 
     invalid_tag = OutputTag("invalid-events", Types.STRING())
     analytical_tag = OutputTag("analytical-events", Types.STRING())
     housekeeping_tag = OutputTag("housekeeping-events", Types.STRING())
+
+    def write_progress(stage, subtask, **values):
+        snapshot = {
+            "run_id": run_id,
+            "stage": stage,
+            "subtask": subtask,
+            **values,
+        }
+        with open(progress_file, "a", encoding="utf-8") as file:
+            file.write(safe_json_dumps(snapshot) + "\n")
+            file.flush()
 
     class NormalizeAndValidate(ProcessFunction):
         def open(self, runtime_context: RuntimeContext):
@@ -46,6 +66,12 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
             self.reason_counters = {}
             self.event_type_counters = {}
             self.exchange_counters = {}
+            self.received_count = 0
+            self.normalized_count = 0
+            self.valid_count = 0
+            self.rejected_count = 0
+            self.last_progress_log = time.monotonic()
+            self.subtask = runtime_context.get_index_of_this_subtask()
 
         def _counter(self, counters, group, prefix, value):
             name = f"{prefix}_{value.lower().replace('-', '_')}"
@@ -55,11 +81,13 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
 
         def process_element(self, value, ctx):
             self.received.inc()
+            self.received_count += 1
             try:
                 record = json.loads(value)
                 normalized = normalize_envelope(record)
                 if not isinstance(normalized, NormalizedEvent):
                     self.rejected.inc()
+                    self.rejected_count += 1
                     self._counter(self.reason_counters, self._metric_group, "records_rejected_reason", normalized.reason_code)
                     if normalized.reason_code in {
                         "invalid_numeric_value",
@@ -72,9 +100,11 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
                     )
                     return
                 self.normalized.inc()
+                self.normalized_count += 1
                 rejection = validate_event(normalized)
                 if rejection is not None:
                     self.rejected.inc()
+                    self.rejected_count += 1
                     self._counter(self.reason_counters, self._metric_group, "records_rejected_reason", rejection.reason_code)
                     if rejection.reason_code == "missing_last_price":
                         self.missing_price.inc()
@@ -83,18 +113,16 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
                     )
                     return
                 self.valid.inc()
+                self.valid_count += 1
                 self._counter(self.event_type_counters, self._metric_group, "records_event_type", normalized.event_type)
                 self._counter(self.exchange_counters, self._metric_group, "records_exchange", normalized.exchange)
                 if normalized.last_price is None:
                     self.missing_price.inc()
                 serialized = safe_json_dumps(normalized.as_dict())
                 yield serialized
-                if normalized.event_type in {"trade", "quote"}:
-                    yield analytical_tag, serialized
-                else:
-                    yield housekeeping_tag, serialized
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 self.rejected.inc()
+                self.rejected_count += 1
                 self._counter(self.reason_counters, self._metric_group, "records_rejected_reason", "malformed_json")
                 yield invalid_tag, safe_json_dumps(
                     to_dead_letter(
@@ -103,12 +131,53 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
                     ).as_dict()
                 )
 
+            finally:
+                if time.monotonic() - self.last_progress_log >= 15:
+                    logger.info(
+                        "Normalization progress",
+                        extra={
+                            "extra": {
+                                "records_received": self.received_count,
+                                "records_normalized": self.normalized_count,
+                                "records_valid": self.valid_count,
+                                "records_rejected": self.rejected_count,
+                            }
+                        }
+                    )
+                    write_progress(
+                        "normalization",
+                        self.subtask,
+                        records_received=self.received_count,
+                        records_normalized=self.normalized_count,
+                        records_valid=self.valid_count,
+                        records_rejected=self.rejected_count,
+                    )
+                    self.last_progress_log = time.monotonic()
+
+    class RouteValidEvents(KeyedProcessFunction):
+        def process_element(self, value, ctx):
+            yield value
+            event_type = json.loads(value)["event_type"]
+            if event_type in {"trade", "quote"}:
+                yield analytical_tag, value
+            else:
+                yield housekeeping_tag, value
+
     class EventTimestampAssigner(TimestampAssigner):
         def extract_timestamp(self, value, record_timestamp):
-            event_time = json.loads(value)["event_time"]
-            return int(datetime.fromisoformat(event_time).timestamp() * 1000)
+            from windowing import window_timestamp
+
+            record = json.loads(value)
+            event_time = datetime.fromisoformat(record["event_time"])
+            shifted = window_timestamp(event_time, record["exchange"])
+            return int(shifted.timestamp() * 1000)
 
     class WindowResult(ProcessWindowFunction):
+        def open(self, runtime_context):
+            self.windows_emitted = 0
+            self.last_progress_log = time.monotonic()
+            self.subtask = runtime_context.get_index_of_this_subtask()
+
         def process(self, key, context, elements):
             from windowing import build_window_result
             records = [json.loads(item) for item in elements]
@@ -133,12 +202,88 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
             ]
             result = build_window_result(typed)
             result["processed_at"] = datetime.now(timezone.utc).isoformat()
+            self.windows_emitted += 1
+            if time.monotonic() - self.last_progress_log >= 15:
+                logger.info(
+                    "Window progress",
+                    extra={"extra": {"windows_emitted": self.windows_emitted}},
+                )
+                write_progress(
+                    "windows",
+                    self.subtask,
+                    windows_emitted=self.windows_emitted,
+                )
+                self.last_progress_log = time.monotonic()
             yield safe_json_dumps(result)
+
+    class AnalyticalProgress(ProcessFunction):
+        def open(self, runtime_context: RuntimeContext):
+            self.processed = 0
+            self.last_progress_log = time.monotonic()
+            self.subtask = runtime_context.get_index_of_this_subtask()
+
+        def process_element(self, value, ctx):
+            self.processed += 1
+            if time.monotonic() - self.last_progress_log >= 15:
+                watermark = ctx.timer_service().current_watermark()
+                logger.info(
+                    "Analytical progress",
+                    extra={
+                        "extra": {
+                            "records_processed": self.processed,
+                            "current_watermark_ms": watermark,
+                            "current_watermark": (
+                                datetime.fromtimestamp(
+                                    watermark / 1000, timezone.utc
+                                ).isoformat()
+                                if watermark >= 0
+                                else "not_advanced"
+                            ),
+                        }
+                    },
+                )
+                write_progress(
+                    "analytical",
+                    self.subtask,
+                    analytical_records=self.processed,
+                    current_watermark=(
+                        datetime.fromtimestamp(
+                            watermark / 1000, timezone.utc
+                        ).isoformat()
+                        if watermark >= 0
+                        else None
+                    ),
+                )
+                self.last_progress_log = time.monotonic()
+            yield value
+
+    class LateProgress(ProcessFunction):
+        def open(self, runtime_context: RuntimeContext):
+            self.processed = 0
+            self.last_progress_log = time.monotonic()
+            self.subtask = runtime_context.get_index_of_this_subtask()
+
+        def process_element(self, value, ctx):
+            self.processed += 1
+            if time.monotonic() - self.last_progress_log >= 15:
+                write_progress(
+                    "late",
+                    self.subtask,
+                    late_records=self.processed,
+                )
+                self.last_progress_log = time.monotonic()
+            yield value
 
     def kafka_sink(topic):
         return (
             KafkaSink.builder()
-            .set_bootstrap_servers(args.broker)
+            .set_bootstrap_servers(args.flink_broker)
+            .set_property("acks", "all")
+            .set_property("retries", "10")
+            .set_property("retry.backoff.ms", "1000")
+            .set_property("reconnect.backoff.ms", "1000")
+            .set_property("request.timeout.ms", "30000")
+            .set_property("delivery.timeout.ms", "120000")
             .set_record_serializer(
                 KafkaRecordSerializationSchema.builder()
                 .set_topic(topic)
@@ -150,6 +295,7 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
 
     env = StreamExecutionEnvironment.get_execution_environment()
     env.set_parallelism(max(1, args.parallelism))
+    env.set_restart_strategy(RestartStrategies.fixed_delay_restart(3, 10_000))
     env.set_python_executable(sys.executable)
     env.add_jars(f"file://{connector_jar}")
 
@@ -161,7 +307,7 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
     topics = [topic.strip() for topic in args.input_topics.split(",") if topic.strip()]
     source = (
         KafkaSource.builder()
-        .set_bootstrap_servers(args.broker)
+        .set_bootstrap_servers(args.flink_broker)
         .set_topics(*topics)
         .set_group_id(args.consumer_group)
         .set_starting_offsets(offsets)
@@ -177,11 +323,17 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
     )
     invalid = classified.get_side_output(invalid_tag)
     invalid.sink_to(kafka_sink(args.dead_letter_topic)).name("dead-letter-output")
-    classified.sink_to(kafka_sink(args.normalized_topic)).name("normalized-output")
-    classified.get_side_output(housekeeping_tag).sink_to(
+    keyed = classified.key_by(
+        lambda value: json.loads(value)["symbol"],
+        key_type=Types.STRING(),
+    )
+    routed = keyed.process(RouteValidEvents(), output_type=Types.STRING())
+    routed.sink_to(kafka_sink(args.normalized_topic)).name("normalized-output")
+
+    routed.get_side_output(housekeeping_tag).sink_to(
         kafka_sink(args.housekeeping_topic)
     ).name("housekeeping-output")
-    analytical = classified.get_side_output(analytical_tag)
+    analytical = routed.get_side_output(analytical_tag)
     watermark_strategy = (
         WatermarkStrategy.for_bounded_out_of_orderness(
             Duration.of_seconds(args.lateness_seconds)
@@ -189,6 +341,9 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
         .with_timestamp_assigner(EventTimestampAssigner())
     )
     timed = analytical.assign_timestamps_and_watermarks(watermark_strategy)
+    timed = timed.process(
+        AnalyticalProgress(), output_type=Types.STRING()
+    )
     late_tag = OutputTag("late-events", Types.STRING())
     windows = (
         timed.key_by(lambda value: json.loads(value)["symbol"], key_type=Types.STRING())
@@ -197,8 +352,17 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
         .side_output_late_data(late_tag)
         .process(WindowResult(), output_type=Types.STRING())
     )
-    windows.sink_to(kafka_sink(args.window_topic)).name("five-minute-windows")
-    windows.get_side_output(late_tag).map(
+    ema_results = (
+        windows.key_by(
+            lambda value: json.loads(value)["symbol"],
+            key_type=Types.STRING(),
+        )
+        .process(create_ema_calculation(), output_type=Types.STRING())
+    )
+    ema_results.sink_to(kafka_sink(args.window_topic)).name("five-minute-ema-results")
+    windows.get_side_output(late_tag).process(
+        LateProgress(), output_type=Types.STRING()
+    ).map(
         lambda value: safe_json_dumps({
             "reason_code": "late_event",
             "details": "event arrived after the configured lateness bound",
@@ -214,6 +378,7 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
             "extra": {
                 "input_topics": ",".join(topics),
                 "consumer_group": args.consumer_group,
+                "broker": args.flink_broker,
                 "starting_offsets": args.starting_offsets,
                 "parallelism": args.parallelism,
                 "connector_jar": connector_jar,
@@ -226,4 +391,40 @@ def run_flink_worker(args, connector_jar: str, logger) -> None:
             }
         },
     )
-    env.execute("trading-event-preparation")
+    logger.info(
+        "Flink stages wired",
+        extra={
+            "extra": {
+                "stages": (
+                    "source,normalize,validate,symbol-route,"
+                    "event-time-window,ema38-ema100"
+                ),
+                "outputs": (
+                    f"dead-letter={args.dead_letter_topic},"
+                    f"normalized={args.normalized_topic},"
+                    f"housekeeping={args.housekeeping_topic},"
+                    f"late={args.late_topic},"
+                    f"windows={args.window_topic}"
+                ),
+            }
+        },
+    )
+    logger.info("Submitting Flink job")
+    try:
+        env.execute("trading-event-preparation")
+    except Exception as exc:
+        root = exc
+        while root.__cause__ is not None:
+            root = root.__cause__
+        logger.error(
+            "Flink job failed",
+            extra={
+                "extra": {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "root_error_type": type(root).__name__,
+                    "root_error": str(root),
+                }
+            },
+        )
+        raise

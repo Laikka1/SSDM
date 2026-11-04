@@ -5,7 +5,8 @@ from zoneinfo import ZoneInfo
 from normalization import normalize_envelope
 from trading_events import NormalizedEvent, Rejection
 from validation import validate_event
-from windowing import build_window_result, window_bounds
+from ema import calculate_ema
+from windowing import build_window_result, window_bounds, window_timestamp
 
 
 def envelope(**payload):
@@ -66,6 +67,27 @@ class PipelineSemanticsTests(unittest.TestCase):
         start, end = window_bounds(boundary)
         self.assertEqual(start, boundary)
         self.assertEqual((end - start).total_seconds(), 300)
+
+    def test_window_timestamp_aligns_exchange_midnight_in_winter_and_summer(self):
+        winter = datetime(2021, 11, 8, 0, 1, tzinfo=ZoneInfo("Europe/Paris"))
+        summer = datetime(2021, 7, 8, 0, 1, tzinfo=ZoneInfo("Europe/Paris"))
+        winter_shifted = window_timestamp(winter, "FR")
+        summer_shifted = window_timestamp(summer, "FR")
+        self.assertEqual(winter_shifted.hour, 0)
+        self.assertEqual(summer_shifted.hour, 0)
+        self.assertEqual(winter_shifted.minute, 1)
+        self.assertEqual(summer_shifted.minute, 1)
+
+    def test_ema_uses_zero_for_first_window(self):
+        close = 100.0
+        self.assertAlmostEqual(calculate_ema(close, 0.0, 38), 2 * close / 39)
+        self.assertAlmostEqual(calculate_ema(close, 0.0, 100), 2 * close / 101)
+
+    def test_ema_uses_previous_value(self):
+        first = calculate_ema(100.0, 0.0, 38)
+        second = calculate_ema(110.0, first, 38)
+        expected = (2 / 39) * 110.0 + (37 / 39) * first
+        self.assertAlmostEqual(second, expected)
 
     def test_window_result_counts_event_types_and_prices(self):
         first = normalize_envelope(envelope(Last="12.5"))

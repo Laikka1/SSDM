@@ -1,12 +1,26 @@
 """Event-time five-minute window calculations."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from trading_events import NormalizedEvent
 
 
 WINDOW_SECONDS = 300
+def window_timestamp(event_time: datetime, exchange: str) -> datetime:
+    """Return a DST-aware wall-clock timestamp for UTC-based windowing."""
+    if event_time.tzinfo is None:
+        raise ValueError("event_time must be timezone-aware")
+    try:
+        exchange_timezone = ZoneInfo({
+            "FR": "Europe/Paris",
+            "NL": "Europe/Amsterdam",
+            "ETR": "Europe/Berlin",
+        }[exchange])
+    except KeyError as exc:
+        raise ValueError(f"unsupported exchange: {exchange}") from exc
+    local = event_time.astimezone(exchange_timezone)
+    return local.replace(tzinfo=None).replace(tzinfo=timezone.utc)
 
 
 def window_bounds(event_time: datetime) -> tuple[datetime, datetime]:
