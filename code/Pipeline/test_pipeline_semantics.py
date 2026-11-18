@@ -1,11 +1,14 @@
 import unittest
+import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from normalization import normalize_envelope
 from trading_events import NormalizedEvent, Rejection
 from validation import validate_event
-from ema import calculate_ema
+from ema import calculate_ema, prepare_output_logs
+from crossover import detect_crossover
+from subscriptions import load_subscriptions, normalize_symbol
 from windowing import build_window_result, window_bounds, window_timestamp
 
 
@@ -88,6 +91,29 @@ class PipelineSemanticsTests(unittest.TestCase):
         second = calculate_ema(110.0, first, 38)
         expected = (2 / 39) * 110.0 + (37 / 39) * first
         self.assertAlmostEqual(second, expected)
+
+    def test_crossover_requires_previous_window(self):
+        self.assertIsNone(detect_crossover(None, None, 2.0, 1.0))
+
+    def test_crossover_detects_buy_and_sell_once(self):
+        self.assertEqual(detect_crossover(1.0, 2.0, 3.0, 2.0), "buy")
+        self.assertEqual(detect_crossover(3.0, 2.0, 1.0, 2.0), "sell")
+        self.assertIsNone(detect_crossover(3.0, 2.0, 4.0, 2.0))
+        self.assertIsNone(detect_crossover(1.0, 2.0, 0.5, 2.0))
+
+    def test_subscriptions_are_normalized_and_deduplicated(self):
+        self.assertEqual(
+            load_subscriptions("abc.fr,ABC.FR,xyz.nl"), {"ABC.FR", "XYZ.NL"}
+        )
+        self.assertIsNone(load_subscriptions())
+        self.assertEqual(load_subscriptions(""), set())
+        with self.assertRaises(ValueError):
+            normalize_symbol("ABC.DE")
+
+    def test_output_logs_are_created_at_startup(self):
+        subscribed_log, advisory_log = prepare_output_logs()
+        self.assertTrue(os.path.isfile(subscribed_log))
+        self.assertTrue(os.path.isfile(advisory_log))
 
     def test_window_result_counts_event_types_and_prices(self):
         first = normalize_envelope(envelope(Last="12.5"))

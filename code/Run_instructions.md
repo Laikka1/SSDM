@@ -47,7 +47,9 @@ The worker creates these topics automatically:
 | `trading-events` | Producer input events |
 | `trading-events-dead-letter` | Malformed, unsupported, or invalid events |
 | `trading-events-late` | Valid events arriving after the configured lateness bound |
-| `trading-events-windows` | Completed five-minute event-time window results |
+| `trading-events-windows-all` | EMA-enriched completed windows for every symbol |
+| `trading-events-windows` | EMA-enriched completed windows for subscribed symbols |
+| `trading-events-advisories` | Buy/sell crossover advisories for subscribed symbols |
 | `trading-events-normalized` | All valid normalized events, including housekeeping |
 | `trading-events-housekeeping` | Valid housekeeping/initialization events |
 
@@ -70,18 +72,34 @@ PYTHONPATH=code/Pipeline python code/Pipeline/streamworker.py \
   --engine flink \
   --broker localhost:9092 \
   --flink-broker localhost:9092 \
-  --consumer-group trading-flink-preparation-run2 \
+  --consumer-group trading-flink-preparation-run4 \
   --input-topics trading-events \
   --starting-offsets earliest \
   --parallelism 1 \
   --dead-letter-topic trading-events-dead-letter \
   --late-topic trading-events-late \
   --window-topic trading-events-windows \
+  --all-window-topic trading-events-windows-all \
+  --advisory-topic trading-events-advisories \
   --normalized-topic trading-events-normalized \
   --housekeeping-topic trading-events-housekeeping \
   --lateness-seconds 60 \
-  --progress-file code/logs/streamworker_progress.jsonl
+  --progress-file code/logs/streamworker_progress.jsonl \
+  --subscribed-symbols I2CET.FR,IGAGU.FR
 ```
+
+Without subscription options, the subscribed output is unfiltered. To publish
+only selected symbols while still calculating state for every symbol, use either
+comma-separated symbols or a file with one exchange-qualified symbol per line:
+
+```bash
+  --subscriptions-file subscriptions.txt
+# or
+  --subscribed-symbols ABC.FR,XYZ.NL
+```
+
+An explicitly empty subscription list produces no subscribed window or advisory
+records. The all-symbol topic remains available for evaluation.
 
 `--lateness-seconds 300` configures the bounded out-of-orderness watermark.
 The event timestamp comes from each row's `Date` and `Time`, interpreted in
@@ -94,8 +112,11 @@ The worker writes its startup configuration, a liveness heartbeat every 15
 seconds, normalization totals, analytical totals with the current event-time
 watermark, completed-window totals, and Flink stage lifecycle to a timestamped
 `code/logs/streamworker_*.log` file. It also creates/appends
-`code/logs/EMA.log` at startup; completed windows are recorded there with their
-symbol, close, EMA38, and EMA100 values.
+`code/logs/EMA.log` at startup; all processed completed windows are recorded
+there with their symbol, close, EMA38, and EMA100 values. Subscribed EMA
+records are additionally written as JSON lines to
+`code/logs/EMA_subscribed.log`. Buy/sell crossover records for subscribed
+symbols are written as JSON lines to `code/logs/advisories.log`.
 
 Progress is exchanged from the local Flink Python operators through
 `code/logs/streamworker_progress.jsonl` and aggregated by the host worker.
@@ -127,6 +148,21 @@ PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
 # A positive --rate intentionally throttles the replay.
 ```
 
+For testing only, skip the first 100,000 data rows in each input file:
+
+```bash
+PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
+  --topic trading-events \
+  --files data/debs2022-gc-trading-day-08-11-21.csv \
+  --skip-rows 100000 \
+  --max-rows 300000 \
+  --rate 1000
+```
+
+`--skip-rows` is applied independently to each file and is intended only for
+small test replays. It does not change the worker's processing or subscription
+logic.
+
 For a clean replay, use a new consumer group, for example
 `trading-flink-preparation-run2`, or use a new input topic in both commands.
 With `--starting-offsets earliest`, the worker reads all records available to
@@ -153,8 +189,14 @@ docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 \
   --topic trading-events-windows --from-beginning --max-messages 5
 
+docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic trading-events-advisories --from-beginning --max-messages 5
+
 tail -n 50 code/logs/streamworker_*.log
 tail -n 50 code/logs/EMA.log
+tail -n 50 code/logs/EMA_subscribed.log
+tail -n 50 code/logs/advisories.log
 ```
 
 ### Inspect Kafka topic counts
@@ -167,7 +209,8 @@ docker exec kafka /opt/kafka/bin/kafka-topics.sh \
 
 for topic in trading-events trading-events-normalized \
   trading-events-housekeeping trading-events-dead-letter \
-  trading-events-late trading-events-windows; do
+  trading-events-late trading-events-windows trading-events-windows-all \
+  trading-events-advisories; do
   echo "=== $topic ==="
   docker exec kafka /opt/kafka/bin/kafka-get-offsets.sh \
     --bootstrap-server localhost:9092 \
@@ -203,7 +246,14 @@ includes the current event-time watermark.
   `event_count`, `event_type_counts`, `valid_price_count`,
   `last_trade_price`, and source/time metadata. `last_trade_price` is the
   valid `Last` value with the greatest event timestamp in that window; it is
-  the price input intended for later EMA calculation.
+  the price input used by the EMA calculation. EMA38 and EMA100 are maintained
+  per symbol. Query 2 emits an advisory when EMA38 crosses EMA100: a transition
+  from EMA38 <= EMA100 to EMA38 > EMA100 is `buy`, and the reverse transition
+  is `sell`. The first valid window cannot produce an advisory because there is
+  no previous EMA pair.
+- The all-symbol window topic is calculated for every valid symbol. The
+  subscribed window and advisory topics are filtered after EMA and crossover
+  state updates, so subscriptions do not change calculations.
 - The normalized topic is the complete valid-event view. The housekeeping
   topic makes initialization/housekeeping records explicit so their unusual
   timestamps can be inspected without treating them as market-event time.

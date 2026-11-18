@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -42,6 +43,7 @@ def run_flink_worker(
     invalid_tag = OutputTag("invalid-events", Types.STRING())
     analytical_tag = OutputTag("analytical-events", Types.STRING())
     housekeeping_tag = OutputTag("housekeeping-events", Types.STRING())
+    advisory_tag = OutputTag("subscribed-advisories", Types.STRING())
 
     def write_progress(stage, subtask, **values):
         snapshot = {
@@ -359,7 +361,89 @@ def run_flink_worker(
         )
         .process(create_ema_calculation(), output_type=Types.STRING())
     )
-    ema_results.sink_to(kafka_sink(args.window_topic)).name("five-minute-ema-results")
+    ema_results.sink_to(kafka_sink(args.all_window_topic)).name(
+        "all-symbol-five-minute-ema-results"
+    )
+
+    class SubscriptionOutput(ProcessFunction):
+        def open(self, runtime_context):
+            log_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "logs",
+            )
+            os.makedirs(log_dir, exist_ok=True)
+            self.subscribed_log = open(
+                os.path.join(log_dir, "EMA_subscribed.log"),
+                "a",
+                encoding="utf-8",
+            )
+            self.advisory_log = open(
+                os.path.join(log_dir, "advisories.log"),
+                "a",
+                encoding="utf-8",
+            )
+
+        def close(self):
+            self.subscribed_log.close()
+            self.advisory_log.close()
+
+        def process_element(self, value, ctx):
+            result = json.loads(value)
+            subscribed = (
+                args.subscribed_symbols is None
+                or result.get("symbol") in args.subscribed_symbols
+            )
+            if subscribed:
+                self.subscribed_log.write(
+                    safe_json_dumps(
+                        {
+                            "event": "subscribed_ema",
+                            "logged_at": datetime.now(timezone.utc).isoformat(),
+                            "symbol": result.get("symbol"),
+                            "window_start": result.get("window_start"),
+                            "window_end": result.get("window_end"),
+                            "close": result.get("close"),
+                            "ema38": result.get("ema38"),
+                            "ema100": result.get("ema100"),
+                            "ema_status": result.get("ema_status"),
+                        }
+                    )
+                    + "\n"
+                )
+                self.subscribed_log.flush()
+                yield value
+                if result.get("advice") is not None:
+                    self.advisory_log.write(
+                        safe_json_dumps(
+                            {
+                                "event": "crossover_advisory",
+                                "logged_at": datetime.now(timezone.utc).isoformat(),
+                                "symbol": result.get("symbol"),
+                                "window_start": result.get("window_start"),
+                                "window_end": result.get("window_end"),
+                                "advice": result.get("advice"),
+                                "reason": result.get("reason"),
+                                "close": result.get("close"),
+                                "previous_ema38": result.get("previous_ema38"),
+                                "previous_ema100": result.get("previous_ema100"),
+                                "ema38": result.get("ema38"),
+                                "ema100": result.get("ema100"),
+                            }
+                        )
+                        + "\n"
+                    )
+                    self.advisory_log.flush()
+                    yield advisory_tag, value
+
+    subscribed_results = ema_results.process(
+        SubscriptionOutput(), output_type=Types.STRING()
+    )
+    subscribed_results.sink_to(kafka_sink(args.window_topic)).name(
+        "subscribed-five-minute-ema-results"
+    )
+    subscribed_results.get_side_output(advisory_tag).sink_to(
+        kafka_sink(args.advisory_topic)
+    ).name("subscribed-crossover-advisories")
     windows.get_side_output(late_tag).process(
         LateProgress(), output_type=Types.STRING()
     ).map(
@@ -385,6 +469,8 @@ def run_flink_worker(
                 "dead_letter_topic": args.dead_letter_topic,
                 "late_topic": args.late_topic,
                 "window_topic": args.window_topic,
+                "all_window_topic": args.all_window_topic,
+                "advisory_topic": args.advisory_topic,
                 "normalized_topic": args.normalized_topic,
                 "housekeeping_topic": args.housekeeping_topic,
                 "lateness_seconds": args.lateness_seconds,
@@ -404,7 +490,9 @@ def run_flink_worker(
                     f"normalized={args.normalized_topic},"
                     f"housekeeping={args.housekeeping_topic},"
                     f"late={args.late_topic},"
-                    f"windows={args.window_topic}"
+                    f"all-windows={args.all_window_topic},"
+                    f"subscribed-windows={args.window_topic},"
+                    f"advisories={args.advisory_topic}"
                 ),
             }
         },

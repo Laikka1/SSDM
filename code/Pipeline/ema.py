@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timezone
 
 from utils import safe_json_dumps
+from crossover import detect_crossover
 
 
 def ema_log_path() -> str:
@@ -28,6 +29,21 @@ def prepare_ema_log() -> str:
             "event=ema_worker_started\n"
         )
     return log_path
+
+
+def prepare_output_logs() -> tuple[str, str]:
+    """Create the subscribed EMA and advisory logs before processing starts."""
+    log_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "logs",
+    )
+    os.makedirs(log_dir, exist_ok=True)
+    subscribed_log = os.path.join(log_dir, "EMA_subscribed.log")
+    advisory_log = os.path.join(log_dir, "advisories.log")
+    for log_path in (subscribed_log, advisory_log):
+        with open(log_path, "a", encoding="utf-8"):
+            pass
+    return subscribed_log, advisory_log
 
 
 def calculate_ema(close: float, previous: float, period: int) -> float:
@@ -72,14 +88,33 @@ def create_ema_calculation():
                 return
 
             previous = json.loads(
-                self.state.value() or '{"ema38": 0.0, "ema100": 0.0}'
+                self.state.value()
+                or '{"ema38": null, "ema100": null}'
             )
-            ema38 = calculate_ema(float(close), previous["ema38"], 38)
-            ema100 = calculate_ema(float(close), previous["ema100"], 100)
+            previous_ema38 = previous.get("ema38")
+            previous_ema100 = previous.get("ema100")
+            ema38 = calculate_ema(float(close), previous_ema38 or 0.0, 38)
+            ema100 = calculate_ema(float(close), previous_ema100 or 0.0, 100)
             result["close"] = close
             result["ema38"] = ema38
             result["ema100"] = ema100
             result["ema_status"] = "calculated"
+            advice = detect_crossover(
+                previous_ema38, previous_ema100, ema38, ema100
+            )
+            if advice is not None:
+                result.update(
+                    {
+                        "advice": advice,
+                        "reason": (
+                            "bullish_crossover"
+                            if advice == "buy"
+                            else "bearish_crossover"
+                        ),
+                        "previous_ema38": previous_ema38,
+                        "previous_ema100": previous_ema100,
+                    }
+                )
             self.state.update(safe_json_dumps({"ema38": ema38, "ema100": ema100}))
             self.log_file.write(
                 f"{datetime.now(timezone.utc).isoformat()} "

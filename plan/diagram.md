@@ -6,8 +6,9 @@ events are retained on their own symbol-keyed Kafka output. Invalid records and
 events that arrive after the lateness bound leave through separate paths.
 
 The current implementation calculates EMA38 and EMA100 for every symbol after
-each completed window. Crossover detection, alert triggers, and subscription
-filtering are intentionally not yet implemented.
+each completed window, detects Query 2 crossovers, and filters user-facing
+window and advisory outputs by optional subscriptions. Smart visualization is
+not implemented.
 
 ```mermaid
 flowchart LR
@@ -36,7 +37,11 @@ flowchart LR
 
     R --> EKEY[Key completed windows<br/>by symbol]
     EKEY --> EMA[ema.py<br/>calculate EMA38 and EMA100<br/>per-symbol keyed state]
-    EMA --> WR[(Window-results topic<br/>EMA-enriched all-symbol results)]
+    EMA --> ALL[(All-symbol EMA results)]
+    EMA --> Q2[crossover.py<br/>Query 2 buy/sell detection]
+    Q2 --> SUB[Subscription filter<br/>after state updates]
+    SUB --> WR[(Subscribed window results)]
+    SUB --> ADV[(Buy/sell advisories)]
 
     E --> OBS[Metrics and structured logs<br/>throughput, latency, rejects, late events]
     W --> OBS

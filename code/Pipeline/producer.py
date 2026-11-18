@@ -67,6 +67,10 @@ def parse_args() -> argparse.Namespace:
         "--max-rows", type=int, default=None,
         help="Maximum rows to publish per file; skips the full-file subset scan",
     )
+    parser.add_argument(
+        "--skip-rows", type=int, default=0,
+        help="Testing only: skip this many data rows at the start of each file",
+    )
     parser.add_argument("--chunksize", "-c", type=int, default=500)
     parser.add_argument(
         "--rate", "-r", type=float, default=200.0,
@@ -116,6 +120,9 @@ def main():
     if args.max_rows is not None and args.max_rows < 1:
         print(f"ERROR: --max-rows must be >= 1, got {args.max_rows}", file=sys.stderr)
         sys.exit(1)
+    if args.skip_rows < 0:
+        print(f"ERROR: --skip-rows must be >= 0, got {args.skip_rows}", file=sys.stderr)
+        sys.exit(1)
 
     logger = get_json_logger("producer", "trading")
 
@@ -135,6 +142,10 @@ def main():
         logger.info(
             f"Testing mode: subset={args.subset}% → per-file caps: "
             + ", ".join(f"{os.path.basename(f)}={max_rows_per_file[f]}" for f in args.files)
+        )
+    if args.skip_rows:
+        logger.info(
+            f"Testing mode: skipping first {args.skip_rows} data rows per file"
         )
     
     logger.info(
@@ -183,8 +194,15 @@ def main():
             reader = pd.read_csv(
                 filepath, chunksize=args.chunksize, comment="#", index_col=False
             )
+            rows_to_skip = args.skip_rows
 
             for chunk_num, chunk in enumerate(reader):
+                if rows_to_skip:
+                    skipped_from_chunk = min(rows_to_skip, len(chunk))
+                    rows_to_skip -= skipped_from_chunk
+                    chunk = chunk.iloc[skipped_from_chunk:]
+                    if chunk.empty:
+                        continue
                 # Replace NaN with None — vectorised
                 chunk = chunk.astype(object).where(pd.notna(chunk), None)
                 records = chunk.to_dict("records")

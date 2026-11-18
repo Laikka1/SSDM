@@ -44,6 +44,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dead-letter-topic", default="trading-events-dead-letter")
     parser.add_argument("--late-topic", default="trading-events-late")
     parser.add_argument("--window-topic", default="trading-events-windows")
+    parser.add_argument("--all-window-topic", default="trading-events-windows-all")
+    parser.add_argument("--advisory-topic", default="trading-events-advisories")
+    parser.add_argument("--subscribed-symbols", default=None)
+    parser.add_argument("--subscriptions-file", default=None)
     parser.add_argument("--normalized-topic", default="trading-events-normalized")
     parser.add_argument("--housekeeping-topic", default="trading-events-housekeeping")
     parser.add_argument("--lateness-seconds", type=int, default=300)
@@ -196,21 +200,32 @@ def main() -> None:
     topics = [topic.strip() for topic in args.input_topics.split(",") if topic.strip()]
     if not topics:
         raise SystemExit("--input-topics must contain at least one topic")
+    from subscriptions import load_subscriptions
+
+    try:
+        args.subscribed_symbols = load_subscriptions(
+            args.subscribed_symbols, args.subscriptions_file
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     ensure_topics(
         args.broker,
         topics + [
             args.dead_letter_topic,
             args.late_topic,
             args.window_topic,
+            args.all_window_topic,
+            args.advisory_topic,
             args.normalized_topic,
             args.housekeeping_topic,
         ],
         logger,
     )
     connector_jar = ensure_connector_jar(logger)
-    from ema import prepare_ema_log
+    from ema import prepare_ema_log, prepare_output_logs
 
     ema_log = prepare_ema_log()
+    subscribed_ema_log, advisory_log = prepare_output_logs()
     logger.info(
         "Streamworker configuration ready",
         extra={
@@ -224,7 +239,14 @@ def main() -> None:
                 "lateness_seconds": args.lateness_seconds,
                 "connector_jar": connector_jar,
                 "ema_log": ema_log,
+                "subscribed_ema_log": subscribed_ema_log,
+                "advisory_log": advisory_log,
                 "progress_file": progress_file,
+                "subscriptions": (
+                    "unfiltered"
+                    if args.subscribed_symbols is None
+                    else ",".join(sorted(args.subscribed_symbols))
+                ),
             }
         },
     )
