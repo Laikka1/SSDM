@@ -197,7 +197,28 @@ tail -n 50 code/logs/streamworker_*.log
 tail -n 50 code/logs/EMA.log
 tail -n 50 code/logs/EMA_subscribed.log
 tail -n 50 code/logs/advisories.log
+tail -n 50 code/logs/lag_metrics.log
 ```
+
+The `lag_metrics.log` file contains JSON records for:
+
+- window `processing_latency_ms`
+- window `window_processing_latency_ms`
+- EMA `ema_processing_latency_ms`
+- replay `replay_backlog_latency_ms`
+- window throughput
+- progress `records_per_second`
+- event-time `watermark_lag_ms`
+- Kafka input `kafka_consumer_lag`
+- advisory `processing_latency_ms`
+
+Window and subscribed/advisory Kafka records include actual stage timestamps
+and separate `window_processing_latency_ms`,
+`ema_processing_latency_ms`, and `replay_backlog_latency_ms`. The replay
+backlog is the wall-clock backlog from the newest producer `_produced_at`
+timestamp to window output and must not be reported as worker CPU latency.
+Kafka consumer lag is measured as high-offset minus committed-offset across
+the input topic partitions.
 
 ### Inspect Kafka topic counts
 
@@ -276,3 +297,103 @@ plus the current event-time watermark. Flink's metric group also contains
 counters for event type, exchange, and missing/invalid price records. For a small replay, compare the number and contents of
 window records against the CSV rows grouped by exchange-qualified symbol and
 five-minute local event-time interval.
+
+## Replay test runs
+
+Start the worker before each test with a fresh consumer group and the symbols
+you want to observe.
+
+```bash
+source .venv311/bin/activate
+PYTHONPATH=code/Pipeline python code/Pipeline/streamworker.py \
+  --engine flink \
+  --broker localhost:9092 \
+  --flink-broker localhost:9092 \
+  --consumer-group trading-test-subscriptions-run1 \
+  --input-topics trading-events \
+  --starting-offsets earliest \
+  --parallelism 1 \
+  --lateness-seconds 60 \
+  --subscribed-symbols I2CET.FR,IGAGU.FR,ASML.NL,A0HN5C.ETR
+```
+Runs subscriptions across Paris, Amsterdam, and Frankfurt and includes symbols
+with valid trade windows and trade-free windows.
+
+```bash
+PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
+  --topic trading-events \
+  --files data/debs2022-gc-trading-day-08-11-21.csv \
+  --max-rows 300000 \
+  --rate 1000
+```
+Runs a limited single-day correctness test at a baseline replay rate.
+
+```bash
+PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
+  --topic trading-events \
+  --files data/debs2022-gc-trading-day-08-11-21.csv \
+  --max-rows 300000 \
+  --rate 5000
+```
+Replays the same dataset subset at moderate load for lag comparison.
+
+```bash
+PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
+  --topic trading-events \
+  --files data/debs2022-gc-trading-day-08-11-21.csv \
+  --max-rows 300000 \
+  --rate 10000
+```
+Replays the same subset at realistic high-load pressure.
+
+```bash
+PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
+  --topic trading-events \
+  --files data/debs2022-gc-trading-day-08-11-21.csv \
+  --skip-rows 100000 \
+  --max-rows 300000 \
+  --rate 5000
+```
+Skips the first 100,000 rows of the file for a faster testing-only replay.
+
+```bash
+PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
+  --topic trading-events \
+  --files \
+    data/debs2022-gc-trading-day-08-11-21.csv \
+    data/debs2022-gc-trading-day-09-11-21.csv \
+  --subset 10 \
+  --rate 5000
+```
+Runs a limited two-day chronological replay at moderate load.
+
+```bash
+PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
+  --topic trading-events \
+  --files \
+    data/debs2022-gc-trading-day-08-11-21.csv \
+    data/debs2022-gc-trading-day-09-11-21.csv \
+    data/debs2022-gc-trading-day-10-11-21.csv \
+    data/debs2022-gc-trading-day-11-11-21.csv \
+    data/debs2022-gc-trading-day-12-11-21.csv \
+    data/debs2022-gc-trading-day-13-11-21.csv \
+    data/debs2022-gc-trading-day-14-11-21.csv \
+  --subset 1 \
+  --rate 10000
+```
+Runs a 1-percent full-week subset at high load for cross-day and long-tail
+scalability evidence.
+
+```bash
+PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
+  --topic trading-events \
+  --files data/debs2022-gc-trading-day-08-11-21.csv \
+  --max-rows 300000 \
+  --rate 0
+```
+Runs the maximum local burst to identify whether the laptop or PC is the
+limiting factor.
+
+For each replay, record the producer throughput and save the resulting values
+from `EMA_subscribed.log`, `advisories.log`, `lag_metrics.log`, and
+`streamworker_progress.jsonl`.

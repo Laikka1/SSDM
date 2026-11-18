@@ -1,12 +1,19 @@
 import unittest
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from normalization import normalize_envelope
 from trading_events import NormalizedEvent, Rejection
 from validation import validate_event
-from ema import calculate_ema, prepare_output_logs
+from ema import (
+    calculate_ema,
+    calculate_processing_latency_ms,
+    calculate_latency_percentiles,
+    calculate_stage_latency_ms,
+    prepare_lag_log,
+    prepare_output_logs,
+)
 from crossover import detect_crossover
 from subscriptions import load_subscriptions, normalize_symbol
 from windowing import build_window_result, window_bounds, window_timestamp
@@ -114,6 +121,24 @@ class PipelineSemanticsTests(unittest.TestCase):
         subscribed_log, advisory_log = prepare_output_logs()
         self.assertTrue(os.path.isfile(subscribed_log))
         self.assertTrue(os.path.isfile(advisory_log))
+        self.assertTrue(os.path.isfile(prepare_lag_log()))
+
+    def test_processing_latency_is_calculated(self):
+        produced = datetime(2026, 11, 18, 19, 0, 0, tzinfo=timezone.utc)
+        emitted = datetime(2026, 11, 18, 19, 0, 2, tzinfo=timezone.utc)
+        self.assertEqual(
+            calculate_processing_latency_ms(produced.isoformat(), emitted),
+            2000.0,
+        )
+
+    def test_stage_latency_and_percentiles(self):
+        started = datetime(2026, 11, 18, 19, 0, 0, tzinfo=timezone.utc)
+        emitted = datetime(2026, 11, 18, 19, 0, 0, 125000, tzinfo=timezone.utc)
+        self.assertEqual(calculate_stage_latency_ms(started, emitted), 125.0)
+        summary = calculate_latency_percentiles([10.0, 20.0, 30.0])
+        self.assertEqual(summary["average_ms"], 20.0)
+        self.assertEqual(summary["p50_ms"], 20.0)
+        self.assertEqual(summary["p95_ms"], 30.0)
 
     def test_window_result_counts_event_types_and_prices(self):
         first = normalize_envelope(envelope(Last="12.5"))

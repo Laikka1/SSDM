@@ -120,7 +120,9 @@ def run_flink_worker(
                 self._counter(self.exchange_counters, self._metric_group, "records_exchange", normalized.exchange)
                 if normalized.last_price is None:
                     self.missing_price.inc()
-                serialized = safe_json_dumps(normalized.as_dict())
+                normalized_payload = normalized.as_dict()
+                normalized_payload["normalized_at"] = datetime.now(timezone.utc).isoformat()
+                serialized = safe_json_dumps(normalized_payload)
                 yield serialized
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 self.rejected.inc()
@@ -178,10 +180,26 @@ def run_flink_worker(
         def open(self, runtime_context):
             self.windows_emitted = 0
             self.last_progress_log = time.monotonic()
+            self.started_at = time.monotonic()
             self.subtask = runtime_context.get_index_of_this_subtask()
+            self.latency_values = []
+            log_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "logs",
+            )
+            os.makedirs(log_dir, exist_ok=True)
+            self.lag_log = open(
+                os.path.join(log_dir, "lag_metrics.log"),
+                "a",
+                encoding="utf-8",
+            )
+
+        def close(self):
+            self.lag_log.close()
 
         def process(self, key, context, elements):
             from windowing import build_window_result
+            window_started_at = datetime.now(timezone.utc)
             records = [json.loads(item) for item in elements]
             typed = [
                 NormalizedEvent(
@@ -203,17 +221,107 @@ def run_flink_worker(
                 for item in records
             ]
             result = build_window_result(typed)
-            result["processed_at"] = datetime.now(timezone.utc).isoformat()
+            emitted_at = datetime.now(timezone.utc)
+            result["window_started_at"] = window_started_at.isoformat()
+            result["processed_at"] = emitted_at.isoformat()
+            result["emitted_at"] = emitted_at.isoformat()
+            produced_times = [
+                item.get("produced_at")
+                for item in records
+                if item.get("produced_at")
+            ]
+            normalized_times = [
+                item.get("normalized_at")
+                for item in records
+                if item.get("normalized_at")
+            ]
+            from ema import (
+                calculate_latency_percentiles,
+                calculate_processing_latency_ms,
+                calculate_stage_latency_ms,
+            )
+            replay_backlog = calculate_processing_latency_ms(
+                max(produced_times, default=None), emitted_at
+            )
+            result["replay_backlog_latency_ms"] = replay_backlog
+            result["processing_latency_ms"] = calculate_stage_latency_ms(
+                window_started_at, emitted_at
+            )
+            result["window_processing_latency_ms"] = result["processing_latency_ms"]
+            result["ema_processing_latency_ms"] = None
+            result["end_to_end_latency_ms"] = result["processing_latency_ms"]
+            self.latency_values.append(result["processing_latency_ms"])
+            self.latency_values = self.latency_values[-1000:]
+            replay_backlog_values = getattr(self, "replay_backlog_values", [])
+            if replay_backlog is not None:
+                replay_backlog_values.append(replay_backlog)
+            self.replay_backlog_values = replay_backlog_values[-1000:]
             self.windows_emitted += 1
+            self.lag_log.write(
+                safe_json_dumps(
+                    {
+                        "kind": "window_latency",
+                        "recorded_at": emitted_at.isoformat(),
+                        "symbol": result["symbol"],
+                        "window_start": result["window_start"],
+                        "window_end": result["window_end"],
+                        "processing_latency_ms": result["processing_latency_ms"],
+                        "replay_backlog_latency_ms": result["replay_backlog_latency_ms"],
+                        "window_processing_latency_ms": result["window_processing_latency_ms"],
+                        "run_id": getattr(args, "run_id", None),
+                        "windows_emitted": self.windows_emitted,
+                        "windows_per_second": round(
+                            self.windows_emitted / max(time.monotonic() - self.started_at, 0.001),
+                            3,
+                        ),
+                    }
+                )
+                + "\n"
+            )
+            self.lag_log.flush()
             if time.monotonic() - self.last_progress_log >= 15:
+                latency_summary = calculate_latency_percentiles(self.latency_values)
+                replay_summary = calculate_latency_percentiles(
+                    getattr(self, "replay_backlog_values", [])
+                )
                 logger.info(
                     "Window progress",
-                    extra={"extra": {"windows_emitted": self.windows_emitted}},
+                    extra={
+                        "extra": {
+                            "windows_emitted": self.windows_emitted,
+                            "windows_per_second": round(
+                                self.windows_emitted
+                                / max(time.monotonic() - self.started_at, 0.001),
+                                3,
+                            ),
+                            "average_processing_latency_ms": latency_summary["average_ms"],
+                            "p95_processing_latency_ms": latency_summary["p95_ms"],
+                            "p99_processing_latency_ms": latency_summary["p99_ms"],
+                            "max_processing_latency_ms": latency_summary["max_ms"],
+                            "average_replay_backlog_latency_ms": replay_summary["average_ms"],
+                            "p95_replay_backlog_latency_ms": replay_summary["p95_ms"],
+                            "max_replay_backlog_latency_ms": replay_summary["max_ms"],
+                        }
+                    },
                 )
                 write_progress(
                     "windows",
                     self.subtask,
                     windows_emitted=self.windows_emitted,
+                    windows_per_second=(
+                        round(
+                            self.windows_emitted
+                            / max(time.monotonic() - self.started_at, 0.001),
+                            3,
+                        )
+                    ),
+                    average_processing_latency_ms=latency_summary["average_ms"],
+                    p95_processing_latency_ms=latency_summary["p95_ms"],
+                    p99_processing_latency_ms=latency_summary["p99_ms"],
+                    max_processing_latency_ms=latency_summary["max_ms"],
+                    average_replay_backlog_latency_ms=replay_summary["average_ms"],
+                    p95_replay_backlog_latency_ms=replay_summary["p95_ms"],
+                    max_replay_backlog_latency_ms=replay_summary["max_ms"],
                 )
                 self.last_progress_log = time.monotonic()
             yield safe_json_dumps(result)
@@ -221,19 +329,39 @@ def run_flink_worker(
     class AnalyticalProgress(ProcessFunction):
         def open(self, runtime_context: RuntimeContext):
             self.processed = 0
+            self.started_at = time.monotonic()
+            self.latest_event_timestamp = None
             self.last_progress_log = time.monotonic()
             self.subtask = runtime_context.get_index_of_this_subtask()
 
         def process_element(self, value, ctx):
             self.processed += 1
+            event_timestamp = ctx.timestamp()
+            if event_timestamp is not None:
+                self.latest_event_timestamp = (
+                    event_timestamp
+                    if self.latest_event_timestamp is None
+                    else max(self.latest_event_timestamp, event_timestamp)
+                )
             if time.monotonic() - self.last_progress_log >= 15:
                 watermark = ctx.timer_service().current_watermark()
+                watermark_lag_ms = (
+                    max(0, self.latest_event_timestamp - watermark)
+                    if self.latest_event_timestamp is not None
+                    else None
+                )
                 logger.info(
                     "Analytical progress",
                     extra={
                         "extra": {
                             "records_processed": self.processed,
+                            "records_per_second": round(
+                                self.processed
+                                / max(time.monotonic() - self.started_at, 0.001),
+                                3,
+                            ),
                             "current_watermark_ms": watermark,
+                            "watermark_lag_ms": watermark_lag_ms,
                             "current_watermark": (
                                 datetime.fromtimestamp(
                                     watermark / 1000, timezone.utc
@@ -248,6 +376,12 @@ def run_flink_worker(
                     "analytical",
                     self.subtask,
                     analytical_records=self.processed,
+                    records_per_second=round(
+                        self.processed
+                        / max(time.monotonic() - self.started_at, 0.001),
+                        3,
+                    ),
+                    watermark_lag_ms=watermark_lag_ms,
                     current_watermark=(
                         datetime.fromtimestamp(
                             watermark / 1000, timezone.utc
@@ -382,10 +516,16 @@ def run_flink_worker(
                 "a",
                 encoding="utf-8",
             )
+            self.lag_log = open(
+                os.path.join(log_dir, "lag_metrics.log"),
+                "a",
+                encoding="utf-8",
+            )
 
         def close(self):
             self.subscribed_log.close()
             self.advisory_log.close()
+            self.lag_log.close()
 
         def process_element(self, value, ctx):
             result = json.loads(value)
@@ -394,11 +534,20 @@ def run_flink_worker(
                 or result.get("symbol") in args.subscribed_symbols
             )
             if subscribed:
+                subscribed_at = datetime.now(timezone.utc)
+                stage_latency = sum(
+                    value
+                    for value in (
+                        result.get("window_processing_latency_ms"),
+                        result.get("ema_processing_latency_ms"),
+                    )
+                    if isinstance(value, (int, float))
+                )
                 self.subscribed_log.write(
                     safe_json_dumps(
                         {
                             "event": "subscribed_ema",
-                            "logged_at": datetime.now(timezone.utc).isoformat(),
+                            "logged_at": subscribed_at.isoformat(),
                             "symbol": result.get("symbol"),
                             "window_start": result.get("window_start"),
                             "window_end": result.get("window_end"),
@@ -406,6 +555,13 @@ def run_flink_worker(
                             "ema38": result.get("ema38"),
                             "ema100": result.get("ema100"),
                             "ema_status": result.get("ema_status"),
+                            "processing_latency_ms": result.get("processing_latency_ms"),
+                            "window_processing_latency_ms": result.get("window_processing_latency_ms"),
+                            "ema_processing_latency_ms": result.get("ema_processing_latency_ms"),
+                            "replay_backlog_latency_ms": result.get("replay_backlog_latency_ms"),
+                            "end_to_end_latency_ms": stage_latency,
+                            "run_id": getattr(args, "run_id", None),
+                            "emitted_at": subscribed_at.isoformat(),
                         }
                     )
                     + "\n"
@@ -413,11 +569,12 @@ def run_flink_worker(
                 self.subscribed_log.flush()
                 yield value
                 if result.get("advice") is not None:
+                    advisory_at = datetime.now(timezone.utc)
                     self.advisory_log.write(
                         safe_json_dumps(
                             {
                                 "event": "crossover_advisory",
-                                "logged_at": datetime.now(timezone.utc).isoformat(),
+                                "logged_at": advisory_at.isoformat(),
                                 "symbol": result.get("symbol"),
                                 "window_start": result.get("window_start"),
                                 "window_end": result.get("window_end"),
@@ -428,11 +585,38 @@ def run_flink_worker(
                                 "previous_ema100": result.get("previous_ema100"),
                                 "ema38": result.get("ema38"),
                                 "ema100": result.get("ema100"),
+                                "processing_latency_ms": result.get("processing_latency_ms"),
+                                "window_processing_latency_ms": result.get("window_processing_latency_ms"),
+                                "ema_processing_latency_ms": result.get("ema_processing_latency_ms"),
+                                "replay_backlog_latency_ms": result.get("replay_backlog_latency_ms"),
+                                "end_to_end_latency_ms": stage_latency,
+                                "run_id": getattr(args, "run_id", None),
+                                "emitted_at": advisory_at.isoformat(),
                             }
                         )
                         + "\n"
                     )
                     self.advisory_log.flush()
+                    self.lag_log.write(
+                        safe_json_dumps(
+                            {
+                                "kind": "advisory_latency",
+                                "recorded_at": advisory_at.isoformat(),
+                                "symbol": result.get("symbol"),
+                                "advice": result.get("advice"),
+                                "window_start": result.get("window_start"),
+                                "window_end": result.get("window_end"),
+                                "processing_latency_ms": result.get("processing_latency_ms"),
+                                "window_processing_latency_ms": result.get("window_processing_latency_ms"),
+                                "ema_processing_latency_ms": result.get("ema_processing_latency_ms"),
+                                "replay_backlog_latency_ms": result.get("replay_backlog_latency_ms"),
+                                "end_to_end_latency_ms": stage_latency,
+                                "run_id": getattr(args, "run_id", None),
+                            }
+                        )
+                        + "\n"
+                    )
+                    self.lag_log.flush()
                     yield advisory_tag, value
 
     subscribed_results = ema_results.process(

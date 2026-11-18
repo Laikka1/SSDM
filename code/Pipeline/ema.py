@@ -46,6 +46,66 @@ def prepare_output_logs() -> tuple[str, str]:
     return subscribed_log, advisory_log
 
 
+def prepare_lag_log() -> str:
+    """Create the lag and latency inspection log before processing starts."""
+    log_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "logs",
+    )
+    os.makedirs(log_dir, exist_ok=True)
+    lag_log = os.path.join(log_dir, "lag_metrics.log")
+    with open(lag_log, "a", encoding="utf-8"):
+        pass
+    return lag_log
+
+
+def calculate_processing_latency_ms(
+    produced_at: str | None, emitted_at: datetime
+) -> float | None:
+    if not produced_at:
+        return None
+    try:
+        produced = datetime.fromisoformat(produced_at)
+        if produced.tzinfo is None:
+            produced = produced.replace(tzinfo=timezone.utc)
+        return max(0.0, (emitted_at - produced.astimezone(timezone.utc)).total_seconds() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def calculate_stage_latency_ms(started_at: datetime, emitted_at: datetime) -> float:
+    """Calculate wall-clock latency within one pipeline stage."""
+    return max(
+        0.0,
+        (emitted_at - started_at.astimezone(timezone.utc)).total_seconds() * 1000,
+    )
+
+
+def calculate_latency_percentiles(values: list[float]) -> dict[str, float | None]:
+    """Calculate small rolling latency summaries without external dependencies."""
+    if not values:
+        return {
+            "average_ms": None,
+            "p50_ms": None,
+            "p95_ms": None,
+            "p99_ms": None,
+            "max_ms": None,
+        }
+    ordered = sorted(values)
+
+    def percentile(percent: float) -> float:
+        index = min(len(ordered) - 1, round((percent / 100) * (len(ordered) - 1)))
+        return ordered[index]
+
+    return {
+        "average_ms": sum(ordered) / len(ordered),
+        "p50_ms": percentile(50),
+        "p95_ms": percentile(95),
+        "p99_ms": percentile(99),
+        "max_ms": ordered[-1],
+    }
+
+
 def calculate_ema(close: float, previous: float, period: int) -> float:
     """Calculate one EMA from a window close and the previous EMA."""
     alpha = 2 / (period + 1)
@@ -71,10 +131,15 @@ def create_ema_calculation():
             self.log_file.close()
 
         def process_element(self, value, ctx):
+            ema_started_at = datetime.now(timezone.utc)
             result = json.loads(value)
             close = result.get("last_trade_price")
             if close is None:
                 result["ema_status"] = "no_valid_close"
+                result["ema_emitted_at"] = datetime.now(timezone.utc).isoformat()
+                result["ema_processing_latency_ms"] = calculate_stage_latency_ms(
+                    ema_started_at, datetime.now(timezone.utc)
+                )
                 self.log_file.write(
                     f"{datetime.now(timezone.utc).isoformat()} "
                     f"symbol={result['symbol']} "
@@ -99,6 +164,11 @@ def create_ema_calculation():
             result["ema38"] = ema38
             result["ema100"] = ema100
             result["ema_status"] = "calculated"
+            ema_emitted_at = datetime.now(timezone.utc)
+            result["ema_emitted_at"] = ema_emitted_at.isoformat()
+            result["ema_processing_latency_ms"] = calculate_stage_latency_ms(
+                ema_started_at, ema_emitted_at
+            )
             advice = detect_crossover(
                 previous_ema38, previous_ema100, ema38, ema100
             )

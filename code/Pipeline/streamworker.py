@@ -8,8 +8,10 @@ import threading
 import time
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 
 from confluent_kafka.admin import AdminClient, NewTopic
+from confluent_kafka import Consumer, TopicPartition
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import get_json_logger
@@ -120,7 +122,12 @@ def start_heartbeat(logger) -> tuple[threading.Event, threading.Thread]:
 
 
 def start_progress_reporter(
-    logger, progress_file: str, run_id: str
+    logger,
+    progress_file: str,
+    run_id: str,
+    broker: str,
+    consumer_group: str,
+    input_topics: list[str],
 ) -> tuple[threading.Event, threading.Thread]:
     stop_event = threading.Event()
     progress_path = os.path.abspath(progress_file)
@@ -128,6 +135,12 @@ def start_progress_reporter(
 
     def emit_progress() -> None:
         last_position = 0
+        kafka_consumer = Consumer({
+            "bootstrap.servers": broker,
+            "group.id": consumer_group,
+            "enable.auto.commit": False,
+        })
+
         while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
             snapshots = []
             try:
@@ -173,7 +186,98 @@ def start_progress_reporter(
             ]
             extra = dict(totals)
             extra["current_watermark"] = min(watermarks) if watermarks else "not_advanced"
+            records_per_second = [
+                snapshot["records_per_second"]
+                for snapshot in latest.values()
+                if snapshot.get("records_per_second") is not None
+            ]
+            windows_per_second = [
+                snapshot["windows_per_second"]
+                for snapshot in latest.values()
+                if snapshot.get("windows_per_second") is not None
+            ]
+            watermark_lags = [
+                snapshot["watermark_lag_ms"]
+                for snapshot in latest.values()
+                if snapshot.get("watermark_lag_ms") is not None
+            ]
+            average_latencies = [
+                snapshot["average_processing_latency_ms"]
+                for snapshot in latest.values()
+                if snapshot.get("average_processing_latency_ms") is not None
+            ]
+            max_latencies = [
+                snapshot["max_processing_latency_ms"]
+                for snapshot in latest.values()
+                if snapshot.get("max_processing_latency_ms") is not None
+            ]
+            p95_latencies = [
+                snapshot["p95_processing_latency_ms"]
+                for snapshot in latest.values()
+                if snapshot.get("p95_processing_latency_ms") is not None
+            ]
+            if records_per_second:
+                extra["records_per_second"] = round(max(records_per_second), 3)
+            if windows_per_second:
+                extra["windows_per_second"] = round(max(windows_per_second), 3)
+            if watermark_lags:
+                extra["watermark_lag_ms"] = max(watermark_lags)
+            if average_latencies:
+                extra["average_processing_latency_ms"] = round(max(average_latencies), 3)
+            if max_latencies:
+                extra["max_processing_latency_ms"] = round(max(max_latencies), 3)
+            if p95_latencies:
+                extra["p95_processing_latency_ms"] = round(max(p95_latencies), 3)
+            kafka_lag = 0
+            lag_available = False
+            try:
+                for topic in input_topics:
+                    metadata = kafka_consumer.list_topics(topic=topic, timeout=5)
+                    topic_metadata = metadata.topics.get(topic)
+                    if topic_metadata is None:
+                        continue
+                    partitions = [
+                        TopicPartition(topic, partition)
+                        for partition in topic_metadata.partitions
+                    ]
+                    if not partitions:
+                        continue
+                    committed = kafka_consumer.committed(partitions, timeout=5)
+                    for partition in committed:
+                        if partition.offset < 0:
+                            low, high = kafka_consumer.get_watermark_offsets(
+                                partition, timeout=5
+                            )
+                            kafka_lag += max(0, high)
+                            lag_available = True
+                            continue
+                        low, high = kafka_consumer.get_watermark_offsets(
+                            partition, timeout=5
+                        )
+                        kafka_lag += max(0, high - partition.offset)
+                        lag_available = True
+            except Exception as exc:
+                extra["kafka_lag_error"] = type(exc).__name__
+            if lag_available:
+                extra["kafka_consumer_lag"] = kafka_lag
+            else:
+                extra["kafka_consumer_lag"] = "not_available"
             logger.info("Streamworker progress", extra={"extra": extra})
+            lag_log = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "logs",
+                "lag_metrics.log",
+            )
+            os.makedirs(os.path.dirname(lag_log), exist_ok=True)
+            lag_snapshot = {
+                "kind": "progress_lag",
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "run_id": run_id,
+                **extra,
+            }
+            with open(lag_log, "a", encoding="utf-8") as file:
+                file.write(safe_json_dumps(lag_snapshot) + "\n")
+        kafka_consumer.close()
 
     reporter = threading.Thread(
         target=emit_progress,
@@ -222,10 +326,11 @@ def main() -> None:
         logger,
     )
     connector_jar = ensure_connector_jar(logger)
-    from ema import prepare_ema_log, prepare_output_logs
+    from ema import prepare_ema_log, prepare_lag_log, prepare_output_logs
 
     ema_log = prepare_ema_log()
     subscribed_ema_log, advisory_log = prepare_output_logs()
+    lag_log = prepare_lag_log()
     logger.info(
         "Streamworker configuration ready",
         extra={
@@ -241,6 +346,7 @@ def main() -> None:
                 "ema_log": ema_log,
                 "subscribed_ema_log": subscribed_ema_log,
                 "advisory_log": advisory_log,
+                "lag_log": lag_log,
                 "progress_file": progress_file,
                 "subscriptions": (
                     "unfiltered"
@@ -256,9 +362,15 @@ def main() -> None:
     logger.info("Starting Flink normalization, windowing, and EMA stages")
     heartbeat_stop, heartbeat = start_heartbeat(logger)
     progress_stop, progress_reporter = start_progress_reporter(
-        logger, progress_file, run_id
+        logger,
+        progress_file,
+        run_id,
+        args.broker,
+        args.consumer_group,
+        topics,
     )
     try:
+        args.run_id = run_id
         run_flink_worker(args, connector_jar, logger, progress_file, run_id)
     finally:
         heartbeat_stop.set()
