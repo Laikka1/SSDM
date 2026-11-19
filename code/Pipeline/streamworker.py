@@ -6,7 +6,9 @@ from functools import partial
 import json
 import os
 from pathlib import Path
+import signal
 import sys
+from tempfile import TemporaryDirectory
 
 from pyflink.common import Configuration, Duration, Row, Types, WatermarkStrategy
 from pyflink.common.restart_strategy import RestartStrategies
@@ -15,6 +17,7 @@ from pyflink.datastream.functions import KeyedProcessFunction, ProcessFunction
 from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
 from pyflink.java_gateway import get_gateway
 
+from build_jvm_window import build_jar
 from calculations import (
     DEFAULT_LATENESS_SECONDS, WINDOW_MS, calculate_ema, detect_crossover,
     lateness_ms, window_end_ms, window_iso,
@@ -275,7 +278,9 @@ def parse_args():
     parser.add_argument("--recoverable-replay", type=Path, metavar="CHECKPOINT_DIR",
                         help="Read an already-produced replay to its current end offsets with Kafka transactions")
     parser.add_argument("--checkpoint-interval-ms", type=int, default=1000)
-    parser.add_argument("--jvm-window-jar", type=Path, help="Use the JVM keyed window operator from this JAR")
+    window_operator = parser.add_mutually_exclusive_group()
+    window_operator.add_argument("--jvm-windows", action="store_true", help="Build and use the JVM window operator")
+    window_operator.add_argument("--jvm-window-jar", type=Path, help="Use a prebuilt JVM window operator JAR")
     parser.add_argument("--kafka-request-timeout-ms", type=int, help="Override the worker's Kafka request timeout")
     parser.add_argument("--rest-port", type=int, help="Expose local Flink job metrics on this loopback port")
     parser.add_argument("--connector-jar", type=Path, default=os.getenv("FLINK_KAFKA_CONNECTOR_JAR"))
@@ -302,15 +307,7 @@ def parse_args():
     return args
 
 
-def main():
-    args = parse_args()
-    local = "PYFLINK_GATEWAY_PORT" not in os.environ
-    if local and not args.print_plan and "FLINK_LOG_DIR" not in os.environ:
-        log_dir = Path(__file__).resolve().parents[1] / "logs" / args.topic_prefix
-        log_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["FLINK_LOG_DIR"] = str(log_dir)
-        os.environ.setdefault("FLINK_IDENT_STRING", f"worker-{os.getpid()}")
-
+def run(args, local):
     config = Configuration()
     if args.rest_port is not None:
         if not local:
@@ -361,5 +358,30 @@ def main():
     env.execute(f"trading-replay:{args.topic_prefix}")
 
 
+def main():
+    args = parse_args()
+    local = "PYFLINK_GATEWAY_PORT" not in os.environ
+    use_temp_logs = local and "FLINK_LOG_DIR" not in os.environ
+    if not args.jvm_windows and not use_temp_logs:
+        run(args, local)
+        return
+
+    with TemporaryDirectory(prefix="ssdm-flink-") as directory:
+        if args.jvm_windows:
+            args.jvm_window_jar = Path(directory) / "price-windows.jar"
+            build_jar(args.jvm_window_jar)
+        if use_temp_logs:
+            os.environ["FLINK_LOG_DIR"] = directory
+        try:
+            run(args, local)
+        finally:
+            if use_temp_logs:
+                del os.environ["FLINK_LOG_DIR"]
+
+
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGTERM, lambda signum, _: sys.exit(128 + signum))
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

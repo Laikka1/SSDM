@@ -1,6 +1,6 @@
 # Trading trend detection
 
-The diagram shows the optimized streaming path used in Test 2.
+The diagram shows the optimized streaming path used in the high-rate replay.
 
 ```mermaid
 flowchart LR

@@ -2,9 +2,7 @@
 
 import argparse
 from dataclasses import dataclass
-import json
 import re
-import time
 
 DEFAULT_PREFIX = "trading-events"
 INPUT_PARTITIONS = 8
@@ -158,7 +156,7 @@ def result_sink(broker, topic, *, transactional=False, request_timeout_ms=None):
     return builder.build()
 
 
-def result_consumer(broker, group, *, partition_eof=False):
+def result_consumer(broker, group):
     from confluent_kafka import Consumer
 
     return Consumer({
@@ -167,49 +165,7 @@ def result_consumer(broker, group, *, partition_eof=False):
         "enable.auto.commit": False,
         "allow.auto.create.topics": False,
         "isolation.level": "read_committed",
-        "enable.partition.eof": partition_eof,
     })
-
-
-def read_outputs(broker, topics):
-    """Read the records already present in the three output topics."""
-    from confluent_kafka import KafkaError, KafkaException, TopicPartition
-
-    consumer = result_consumer(broker, "trading-reference", partition_eof=True)
-    try:
-        ends = {}
-        starts = []
-        for name in topics.outputs():
-            partition = TopicPartition(name, 0)
-            low, high = consumer.get_watermark_offsets(partition, timeout=5)
-            if low < high:
-                starts.append(TopicPartition(name, 0, low))
-                ends[name] = high
-
-        consumer.assign(starts)
-        deadline = time.monotonic() + 10
-        while ends and time.monotonic() < deadline:
-            message = consumer.poll(1)
-            if message is None:
-                continue
-            name = message.topic()
-            end = ends.get(name)
-            error = message.error()
-            if error and error.code() != KafkaError._PARTITION_EOF:
-                raise KafkaException(error)
-            if end is None:
-                continue
-            next_offset = message.offset() if error else message.offset() + 1
-            if next_offset >= end:
-                consumer.pause([TopicPartition(name, 0)])
-                del ends[name]
-            if not error and message.offset() < end:
-                deadline = time.monotonic() + 10
-                yield {"topic": name, "record": json.loads(message.value())}
-        if ends:
-            raise RuntimeError(f"timed out reading Kafka results from {sorted(ends)}")
-    finally:
-        consumer.close()
 
 
 def main():

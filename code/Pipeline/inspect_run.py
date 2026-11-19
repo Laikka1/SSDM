@@ -145,7 +145,7 @@ class Flink:
         data = self.get(f"/jobs/{self.job_id}/exceptions")
         lines = (data.get("root-exception") or "").splitlines()
         if not lines:
-            return "Check flink.log or the Flink UI for the worker error."
+            return "Check the worker terminal or the Flink UI for the error."
         return next((line for line in reversed(lines) if line.startswith("Caused by:")), lines[0])
 
     def metric_samples(self, path, names):
@@ -340,14 +340,14 @@ def monitor(args, topics, results, worker_log):
 
             now = time.monotonic()
             if not ready and now - started >= args.timeout:
-                log("FAILED", reason="worker did not become ready", details="Check flink.log and the topic prefix.")
+                log("FAILED", reason="worker did not become ready", details="Check the worker terminal and topic prefix.")
                 return 1
             if ready and now - last_job_seen >= args.timeout:
                 log("FAILED", job_id=flink.job_id, reason="worker stopped responding",
                     details="Check the Flink logs for this replay.")
                 return 1
             if journal.finished is not None and now - journal.finished >= args.timeout:
-                log("FAILED", reason="replay did not drain", details="Check the last progress line and flink.log.")
+                log("FAILED", reason="replay did not drain", details="Check the last progress line and worker terminal.")
                 return 1
     finally:
         consumer.close()
