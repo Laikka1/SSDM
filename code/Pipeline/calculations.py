@@ -1,15 +1,17 @@
-"""Pure crossover detection for the two EMA query."""
+"""EMA and crossover equations for the trading queries."""
+
+
+def calculate_ema(close: float, previous: float, period: int) -> float:
+    alpha = 2 / (period + 1)
+    return alpha * close + (1 - alpha) * previous
 
 
 def detect_crossover(
-    previous_ema38: float | None,
-    previous_ema100: float | None,
+    previous_ema38: float,
+    previous_ema100: float,
     current_ema38: float,
     current_ema100: float,
 ) -> str | None:
-    """Return buy or sell when the EMA ordering changes."""
-    if previous_ema38 is None or previous_ema100 is None:
-        return None
     if previous_ema38 <= previous_ema100 and current_ema38 > current_ema100:
         return "buy"
     if previous_ema38 >= previous_ema100 and current_ema38 < current_ema100:

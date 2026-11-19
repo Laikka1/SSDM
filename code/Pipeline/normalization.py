@@ -1,122 +1,201 @@
-"""Normalization of producer envelopes into stable trading events."""
+"""Trading record normalization, classification, and symbol subscriptions."""
 
-from datetime import datetime
+from datetime import datetime, time
+from functools import lru_cache
 from math import isfinite
-from typing import Any
+from pathlib import Path
+import re
 from zoneinfo import ZoneInfo
 
-from trading_events import EXCHANGE_TIMEZONES, NormalizedEvent, Rejection, SUPPORTED_SECURITY_TYPES
+SUPPORTED_SECURITY_TYPES = {"E", "I"}
+EXCHANGE_TIMEZONES = {
+    "FR": "Europe/Paris",
+    "NL": "Europe/Amsterdam",
+    "ETR": "Europe/Berlin",
+}
+
+PRICE = "price"
+QUOTE = "quote_only"
+HOUSEKEEPING = "housekeeping_or_metadata"
+REJECTED = "rejected"
+TERMINAL_CLASSES = ("price_accepted", "price_late", QUOTE, HOUSEKEEPING, REJECTED)
+REJECT_REASONS = (
+    "invalid_envelope", "malformed_json", "invalid_csv_row", "missing_symbol",
+    "invalid_symbol", "invalid_security_type", "invalid_numeric_value",
+    "invalid_price_value", "invalid_trade_time", "ambiguous_trading_date",
+)
+CLOCK_RE = re.compile(r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?")
+MARKET_ZONES = {exchange: ZoneInfo(zone) for exchange, zone in EXCHANGE_TIMEZONES.items()}
 
 
-_EVENT_FIELDS = (("ask", "Ask"), ("bid", "Bid"), ("trade", "Last"))
-
-
-def _value(payload: dict[str, Any], name: str) -> Any:
-    value = payload.get(name)
-    if value is None:
-        value = payload.get(name.strip())
-    return value
-
-
-def _parse_symbol(raw_symbol: Any) -> tuple[str, str] | Rejection:
-    if not isinstance(raw_symbol, str) or not raw_symbol.strip():
-        return Rejection("missing_symbol", "ID.[Exchange] is missing")
-    symbol = raw_symbol.strip().upper()
+def normalize_symbol(value: str) -> str:
+    symbol = value.strip().upper()
     parts = symbol.rsplit(".", 1)
     if len(parts) != 2 or not parts[0] or parts[1] not in EXCHANGE_TIMEZONES:
-        return Rejection("invalid_symbol", "symbol must be INSTRUMENT.FR, INSTRUMENT.NL, or INSTRUMENT.ETR")
-    return symbol, parts[1]
+        raise ValueError(
+            f"invalid subscription symbol {value!r}; expected INSTRUMENT.FR, "
+            "INSTRUMENT.NL, or INSTRUMENT.ETR"
+        )
+    return symbol
 
 
-def _parse_price(value: Any, field: str) -> float | None | Rejection:
-    try:
-        price = float(str(value).strip())
-    except (TypeError, ValueError):
-        return Rejection("invalid_numeric_value", f"{field} is not numeric")
-    if not isfinite(price) or price < 0:
-        return Rejection("invalid_price_value", f"{field} must be finite and non-negative")
-    if price == 0:
+def load_subscriptions(
+    symbols: str | None = None, file_path: str | None = None
+) -> set[str] | None:
+    """Return configured symbols, or None when output should remain unfiltered."""
+    if symbols is None and file_path is None:
         return None
+
+    values: list[str] = []
+    if symbols is not None:
+        values.extend(symbols.split(","))
+    if file_path is not None:
+        try:
+            values.extend(
+                line.split("#", 1)[0].strip()
+                for line in Path(file_path).read_text(encoding="utf-8").splitlines()
+            )
+        except OSError as exc:
+            raise ValueError(f"could not read subscriptions file {file_path!r}: {exc}") from exc
+
+    return {normalize_symbol(value) for value in values if value.strip()}
+
+
+@lru_cache(maxsize=64)
+def _parse_date(value):
+    return datetime.strptime(value, "%d-%m-%Y").date()
+
+
+def _parse_clock(value):
+    if not CLOCK_RE.fullmatch(value):
+        raise ValueError("invalid clock")
+    return time.fromisoformat(value)
+
+
+def _clock_offset_us(clock):
+    return ((clock.hour * 60 + clock.minute) * 60 + clock.second) * 1_000_000 + clock.microsecond
+
+
+def _trade_clock(trading_date, trading_time, capture_date, capture_time, exchange):
+    try:
+        clock = _parse_clock(trading_time)
+        if not trading_date:
+            try:
+                capture_clock = _parse_clock(capture_time)
+            except ValueError:
+                capture_clock = None
+            # A blank date near a midnight rollover cannot establish the trade's day.
+            if capture_clock and abs(_clock_offset_us(clock) - _clock_offset_us(capture_clock)) > 43_200_000_000:
+                return None, "ambiguous_trading_date"
+        local = datetime.combine(
+            _parse_date(trading_date or capture_date), clock, tzinfo=MARKET_ZONES[exchange]
+        )
+        epoch_second = int(local.replace(microsecond=0).timestamp())
+        timestamp_us = epoch_second * 1_000_000 + clock.microsecond
+        if timestamp_us < 2000:
+            return None, "invalid_trade_time"
+        return timestamp_us, "explicit" if trading_date else "capture_date_fallback"
+    except (ValueError, OverflowError):
+        return None, "invalid_trade_time"
+
+
+def _text(row, name):
+    return (row.get(name) or "").strip()
+
+
+def project_row(row, source_file, source_index, source_row):
+    """Represent one raw row with its query fields, source identity and capture clock."""
+    raw_id = _text(row, "ID.[Exchange]") or _text(row, "ID")
+    symbol = raw_id.upper()
+    exchange = symbol.rsplit(".", 1)[-1] if "." in symbol else ""
+    last = _text(row, "Last")
+    capture_date, capture_time = _text(row, "Date"), _text(row, "Time")
+    trading_date, trading_time = _text(row, "Trading date"), _text(row, "Trading time")
+    trade_us, trade_clock = None, "unused"
+    if last and exchange in MARKET_ZONES:
+        try:
+            positive = 0 < float(last) < float("inf")
+        except ValueError:
+            positive = False
+        if positive:
+            trade_us, trade_clock = _trade_clock(
+                trading_date, trading_time, capture_date, capture_time, exchange
+            )
+    return {
+        "kind": "row",
+        "symbol": symbol,
+        "exchange": exchange if exchange in MARKET_ZONES else "",
+        "sec_type": _text(row, "SecType").upper(),
+        "last": last,
+        "ask": _text(row, "Ask"),
+        "bid": _text(row, "Bid"),
+        "trade_us": trade_us,
+        "trade_clock": trade_clock,
+        "capture_date": capture_date,
+        "capture_time": capture_time,
+        "trading_date": trading_date,
+        "trading_time": trading_time,
+        "source_file": source_file,
+        "source_index": source_index,
+        "source_row": source_row,
+        **({"csv_error": True} if any(row.get(None, ())) or None in row.values() else {}),
+    }
+
+
+def _positive_price(value):
+    if not isinstance(value, str):
+        raise ValueError("invalid_envelope")
+    if not value:
+        return 0.0
+    try:
+        price = float(value)
+    except ValueError:
+        raise ValueError("invalid_numeric_value") from None
+    if not isfinite(price) or price < 0:
+        raise ValueError("invalid_price_value")
     return price
 
 
-def _parse_event_time(payload: dict[str, Any], exchange: str) -> tuple[str, datetime] | Rejection:
-    date_value = _value(payload, "Date")
-    time_value = _value(payload, "Time")
-    if not isinstance(date_value, str) or not isinstance(time_value, str):
-        return Rejection("invalid_event_time", "Date and Time are required")
+def classify_row(record):
+    """Return (class, price, reason); the keyed operator distinguishes accepted from late."""
+    if not isinstance(record, dict) or record.get("kind") != "row":
+        return REJECTED, 0.0, "invalid_envelope"
+    if (
+        type(record.get("source_index")) is not int or record["source_index"] < 0
+        or type(record.get("source_row")) is not int or record["source_row"] < 1
+        or not isinstance(record.get("source_file"), str) or not record["source_file"]
+    ):
+        return REJECTED, 0.0, "invalid_envelope"
+    if record.get("csv_error"):
+        return REJECTED, 0.0, "invalid_csv_row"
+    symbol = record.get("symbol")
+    if not isinstance(symbol, str) or not symbol:
+        return REJECTED, 0.0, "missing_symbol"
     try:
-        local = datetime.strptime(
-            f"{date_value.strip()} {time_value.strip()}",
-            "%d-%m-%Y %H:%M:%S.%f",
-        ).replace(tzinfo=ZoneInfo(EXCHANGE_TIMEZONES[exchange]))
+        normalized = normalize_symbol(symbol)
+    except ValueError:
+        return REJECTED, 0.0, "invalid_symbol"
+    if normalized != symbol or record.get("exchange") != symbol.rsplit(".", 1)[1]:
+        return REJECTED, 0.0, "invalid_symbol"
+    sec_type = record.get("sec_type")
+    if not isinstance(sec_type, str) or sec_type not in SUPPORTED_SECURITY_TYPES:
+        return REJECTED, 0.0, "invalid_security_type"
+    try:
+        last = _positive_price(record.get("last"))
+        ask = _positive_price(record.get("ask"))
+        bid = _positive_price(record.get("bid"))
     except ValueError as exc:
-        return Rejection("invalid_event_time", str(exc))
-    return date_value.strip(), local
-
-
-def normalize_envelope(envelope: dict[str, Any]) -> NormalizedEvent | Rejection:
-    """Normalize one producer envelope, returning a typed rejection on failure."""
-    if not isinstance(envelope, dict):
-        return Rejection("invalid_envelope", "record must be an object")
-    payload = envelope.get("payload")
-    if not isinstance(payload, dict):
-        return Rejection("missing_payload", "record payload must be an object")
-
-    event_id = envelope.get("event_key")
-    if not isinstance(event_id, str) or not event_id.strip():
-        return Rejection("missing_event_id", "event_key is required")
-        
-    symbol_result = _parse_symbol(payload.get("ID.[Exchange]", envelope.get("symbol")))
-    if isinstance(symbol_result, Rejection):
-        return symbol_result
-    symbol, exchange = symbol_result
-
-    security_type = _value(payload, "SecType")
-    if security_type not in SUPPORTED_SECURITY_TYPES:
-        return Rejection("invalid_security_type", "SecType must be E or I")
-        
-    time_result = _parse_event_time(payload, exchange)
-    if isinstance(time_result, Rejection):
-        return time_result
-    trading_date, event_time = time_result
-
-    present = []
-    for event_type, field in _EVENT_FIELDS:
-        value = _value(payload, field)
-        if value not in (None, ""):
-            present.append((event_type, field, value))
-    parsed_prices = {}
-    available_attributes = tuple(field.lower() for _, field, _ in present)
-    for event_type, field, raw_price in present:
-        price_result = _parse_price(raw_price, field)
-        if isinstance(price_result, Rejection):
-            return price_result
-        if price_result is not None:
-            parsed_prices[event_type] = price_result
-    if parsed_prices:
-        event_type = "trade" if "trade" in parsed_prices else "quote"
-        last_price = parsed_prices.get("trade")
-    else:
-        event_type, last_price = "housekeeping", None
-
-    source_row = envelope.get("_source_row")
-    if source_row is not None and not isinstance(source_row, int):
-        return Rejection("invalid_source_metadata", "_source_row must be an integer")
-
-    return NormalizedEvent(
-        event_id=event_id.strip(),
-        symbol=symbol,
-        exchange=exchange,
-        security_type=SUPPORTED_SECURITY_TYPES[security_type],
-        trading_date=trading_date,
-        event_time=event_time,
-        last_price=last_price,
-        event_type=event_type,
-        available_attributes=available_attributes,
-        source_file=envelope.get("_source_file"),
-        source_row=source_row,
-        produced_at=envelope.get("_produced_at"),
-        original_payload=payload,
-        original_envelope=envelope,
-    )
+        return REJECTED, 0.0, str(exc)
+    if last:
+        clock = record.get("trade_clock")
+        if clock == "ambiguous_trading_date":
+            return REJECTED, 0.0, clock
+        trade_us = record.get("trade_us")
+        if clock not in ("explicit", "capture_date_fallback") or type(trade_us) is not int:
+            return REJECTED, 0.0, "invalid_trade_time"
+        if not 2000 <= trade_us <= 253_402_300_799_999_999:
+            return REJECTED, 0.0, "invalid_trade_time"
+        return PRICE, last, None
+    if ask or bid:
+        return QUOTE, 0.0, "quote_without_trade"
+    return HOUSEKEEPING, 0.0, "no_positive_price"

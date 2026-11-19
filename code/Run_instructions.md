@@ -1,399 +1,319 @@
-# Trading Event Preparation Pipeline
+# Run the trading pipeline
 
-## Prerequisites
+Use Bash in Ubuntu WSL with Python 3.11, Java 17, and Docker Compose.
 
-- Python 3.11 virtual environment
-- Docker with Compose
-- Trading Data files in `data/`
-- The Flink Kafka connector jar is downloaded automatically when the worker
-  starts if it is missing.
-- If you run without internet access, set `FLINK_KAFKA_CONNECTOR_JAR` to a
-  local jar path.
-
-## Setup
-
-1. Install Python 3.11 and create a dedicated virtual environment.
+## One-time setup
 
 ```bash
-sudo apt update
-sudo apt install -y software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv
-
+cd /home/jerry/SSDM
 python3.11 -m venv .venv311
 source .venv311/bin/activate
-python -m pip install -U pip wheel
-python -m pip install -r code/requirements.txt
+python \
+  -m pip install \
+  --requirement code/requirements.txt
 ```
 
-The repository does not need to keep the Kafka connector jars checked in.
+Run one setup at a time. Start at Terminal 1 in the setup you choose. Wait
+for `READY` in Terminal 3 before starting the producer. After `DRAINED`, run
+the reference check in Terminal 4, then stop the Flink worker in Terminal 2
+with Ctrl+C. Kafka can stay running between tests.
 
-## Terminal 1 - Start Kafka
+## Default run · 100,000 rows from November 8 at 1,000 rows/s
+
+Replay the first 100,000 records from the November 8 tick file. The
+worker publishes results for `INCAC.FR` and `INEUN.NL`.
+
+### Terminal 1 · Start Kafka and prepare a fresh replay
+
+This creates a new prefix and saves it for the other terminals. Continue
+when the command prints `Replay prefix`.
 
 ```bash
-cd code
-docker compose up -d kafka
-docker compose ps
+(
+  set -e
+  cd /home/jerry/SSDM
+  source .venv311/bin/activate
+  PREFIX="trading-events-$(date +%Y%m%d-%H%M%S-%N)"
+  DELAY=1
+  mkdir -p "code/logs/$PREFIX"
+  docker compose \
+    --file code/docker-compose.yml \
+    up \
+    --detach \
+    --wait \
+    kafka
+  python code/Pipeline/kafka_io.py \
+    --topic-prefix "$PREFIX"
+  printf 'export PREFIX=%q\nexport DELAY=%q\n' "$PREFIX" "$DELAY" > code/logs/current-run.env
+  printf 'Replay prefix %s\n' "$PREFIX"
+)
 ```
 
-The current worker uses a local PyFlink MiniCluster, so the Docker Flink
-JobManager and TaskManager are not required.
-
-The worker creates these topics automatically:
-
-| Topic | Contents |
-|---|---|
-| `trading-events` | Producer input events |
-| `trading-events-dead-letter` | Malformed, unsupported, or invalid events |
-| `trading-events-late` | Valid events arriving after the configured lateness bound |
-| `trading-events-windows-all` | EMA-enriched completed windows for every symbol |
-| `trading-events-windows` | EMA-enriched completed windows for subscribed symbols |
-| `trading-events-advisories` | Buy/sell crossover advisories for subscribed symbols |
-| `trading-events-normalized` | All valid normalized events, including housekeeping |
-| `trading-events-housekeeping` | Valid housekeeping/initialization events |
-
-The current Python worker runs the Flink job locally, so both Kafka addresses
-must use the host-published Kafka port:
+### Terminal 2 · Start the Flink consumer
 
 ```bash
---broker localhost:9092 --flink-broker localhost:9092
-```
-
-## Terminal 2 - Start the Flink worker
-
-Run this from the repository root. Keep this terminal running for the full
-replay:
-
-```bash
+cd /home/jerry/SSDM
 source .venv311/bin/activate
-
-PYTHONPATH=code/Pipeline python code/Pipeline/streamworker.py \
-  --engine flink \
-  --broker localhost:9092 \
-  --flink-broker localhost:9092 \
-  --consumer-group trading-flink-preparation-run4 \
-  --input-topics trading-events \
-  --starting-offsets earliest \
-  --parallelism 1 \
-  --dead-letter-topic trading-events-dead-letter \
-  --late-topic trading-events-late \
-  --window-topic trading-events-windows \
-  --all-window-topic trading-events-windows-all \
-  --advisory-topic trading-events-advisories \
-  --normalized-topic trading-events-normalized \
-  --housekeeping-topic trading-events-housekeeping \
-  --lateness-seconds 60 \
-  --progress-file code/logs/streamworker_progress.jsonl \
-  --subscribed-symbols I2CET.FR,IGAGU.FR
+source code/logs/current-run.env
+set -o pipefail
+PYTHONPATH="$PWD/code/Pipeline" python code/Pipeline/streamworker.py \
+  --topic-prefix "$PREFIX" \
+  --lateness-seconds "$DELAY" \
+  --rest-port 8082 \
+  --subscribed-symbols INCAC.FR,INEUN.NL \
+  2>&1 | tee "code/logs/$PREFIX/flink.log"
 ```
 
-Without subscription options, the subscribed output is unfiltered. To publish
-only selected symbols while still calculating state for every symbol, use either
-comma-separated symbols or a file with one exchange-qualified symbol per line:
+### Terminal 3 · Follow the live logs
 
 ```bash
-  --subscriptions-file subscriptions.txt
-# or
-  --subscribed-symbols ABC.FR,XYZ.NL
-```
-
-An explicitly empty subscription list produces no subscribed window or advisory
-records. The all-symbol topic remains available for evaluation.
-
-`--lateness-seconds 300` configures the bounded out-of-orderness watermark.
-The event timestamp comes from each row's `Date` and `Time`, interpreted in
-the exchange timezone: Paris (`FR`), Amsterdam (`NL`), or Frankfurt (`ETR`).
-It is not replaced with processing time. Events that arrive after the
-watermark are routed to the late-event topic; the window operator does not
-reopen an already emitted window.
-
-The worker writes its startup configuration, a liveness heartbeat every 15
-seconds, normalization totals, analytical totals with the current event-time
-watermark, completed-window totals, and Flink stage lifecycle to a timestamped
-`code/logs/streamworker_*.log` file. It also creates/appends
-`code/logs/EMA.log` at startup; all processed completed windows are recorded
-there with their symbol, close, EMA38, and EMA100 values. Subscribed EMA
-records are additionally written as JSON lines to
-`code/logs/EMA_subscribed.log`. Buy/sell crossover records for subscribed
-symbols are written as JSON lines to `code/logs/advisories.log`.
-
-Progress is exchanged from the local Flink Python operators through
-`code/logs/streamworker_progress.jsonl` and aggregated by the host worker.
-Each progress line reports received, normalized, valid, rejected, analytical,
-late, and completed-window totals plus the current watermark. Kafka sink
-retries and a bounded Flink restart strategy handle transient broker
-disconnects; unrecoverable failures are logged with their root exception.
-
-Keep the worker terminal running while records are processed. To follow the
-worker and progress logs from another terminal:
-
-```bash
-tail -f code/logs/streamworker_*.log
-tail -f code/logs/streamworker_progress.jsonl
-```
-
-## Terminal 3 - Produce a replay
-
-```bash
+cd /home/jerry/SSDM
 source .venv311/bin/activate
-
-PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
-  --topic trading-events \
-  --files data/debs2022-gc-trading-day-08-11-21.csv \
-  --max-rows 200000 \
-  --rate 1000
-
-# For a larger replay, omit --max-rows or use --subset 1.
-# A positive --rate intentionally throttles the replay.
+source code/logs/current-run.env
+python code/Pipeline/inspect_run.py \
+  --topic-prefix "$PREFIX"
 ```
 
-For testing only, skip the first 100,000 data rows in each input file:
+### Terminal 4 · Run the producer
 
 ```bash
-PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
-  --topic trading-events \
-  --files data/debs2022-gc-trading-day-08-11-21.csv \
-  --skip-rows 100000 \
-  --max-rows 300000 \
-  --rate 1000
-```
-
-`--skip-rows` is applied independently to each file and is intended only for
-small test replays. It does not change the worker's processing or subscription
-logic.
-
-For a clean replay, use a new consumer group, for example
-`trading-flink-preparation-run2`, or use a new input topic in both commands.
-With `--starting-offsets earliest`, the worker reads all records available to
-that consumer group from the beginning.
-
-## Terminal 4 - Verify results
-
-Inspect a few input, dead-letter, late-event, and window records:
-
-```bash
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic trading-events --from-beginning --max-messages 3
-
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic trading-events-dead-letter --from-beginning --max-messages 5
-
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic trading-events-late --from-beginning --max-messages 5
-
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic trading-events-windows --from-beginning --max-messages 5
-
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic trading-events-advisories --from-beginning --max-messages 5
-
-tail -n 50 code/logs/streamworker_*.log
-tail -n 50 code/logs/EMA.log
-tail -n 50 code/logs/EMA_subscribed.log
-tail -n 50 code/logs/advisories.log
-tail -n 50 code/logs/lag_metrics.log
-```
-
-The `lag_metrics.log` file contains JSON records for:
-
-- window `processing_latency_ms`
-- window `window_processing_latency_ms`
-- EMA `ema_processing_latency_ms`
-- replay `replay_backlog_latency_ms`
-- window throughput
-- progress `records_per_second`
-- event-time `watermark_lag_ms`
-- Kafka input `kafka_consumer_lag`
-- advisory `processing_latency_ms`
-
-Window and subscribed/advisory Kafka records include actual stage timestamps
-and separate `window_processing_latency_ms`,
-`ema_processing_latency_ms`, and `replay_backlog_latency_ms`. The replay
-backlog is the wall-clock backlog from the newest producer `_produced_at`
-timestamp to window output and must not be reported as worker CPU latency.
-Kafka consumer lag is measured as high-offset minus committed-offset across
-the input topic partitions.
-
-### Inspect Kafka topic counts
-
-Check topic names and partition counts:
-
-```bash
-docker exec kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 --list
-
-for topic in trading-events trading-events-normalized \
-  trading-events-housekeeping trading-events-dead-letter \
-  trading-events-late trading-events-windows trading-events-windows-all \
-  trading-events-advisories; do
-  echo "=== $topic ==="
-  docker exec kafka /opt/kafka/bin/kafka-get-offsets.sh \
-    --bootstrap-server localhost:9092 \
-    --topic "$topic"
-done
-```
-
-The `kafka-get-offsets.sh` output shows the latest offset for each partition.
-Sum the partition offsets to estimate the number of records available. The
-worker's streamworker log reports analytical records every 1,000 records and
-includes the current event-time watermark.
-
-### How to interpret the output
-
-- A normalized valid event has `event_id`, an exchange-qualified `symbol`
-  such as `A0HN5C.ETR`, an exchange, security type, an ISO timezone-aware
-  `event_time`, an `event_type`, available attributes, and source metadata.
-- All structurally valid events are normalized and written to the normalized
-  topic. Housekeeping/initialization events are also written to the
-  housekeeping topic and counted for observability, but do not advance the
-  analytical event-time watermark. Trade and quote events enter the
-  symbol-keyed five-minute windows. Only positive finite `Last` trade values
-  are used for EMA price selection.
-- A dead-letter record has a `reason_code`, `details`, original envelope and
-  payload. These records indicate normalization or validation failures and
-  should not stop the job.
-- A late-event record has `reason_code: "late_event"` and preserves the
-  normalized event identity. It indicates that the event was beyond the
-  configured event-time lateness bound.
-- A window record is emitted after the event-time watermark passes the
-  window end. Its `window_start` and `window_end` are five-minute boundaries
-  aligned to midnight in the event's exchange timezone. It includes
-  `event_count`, `event_type_counts`, `valid_price_count`,
-  `last_trade_price`, and source/time metadata. `last_trade_price` is the
-  valid `Last` value with the greatest event timestamp in that window; it is
-  the price input used by the EMA calculation. EMA38 and EMA100 are maintained
-  per symbol. Query 2 emits an advisory when EMA38 crosses EMA100: a transition
-  from EMA38 <= EMA100 to EMA38 > EMA100 is `buy`, and the reverse transition
-  is `sell`. The first valid window cannot produce an advisory because there is
-  no previous EMA pair.
-- The all-symbol window topic is calculated for every valid symbol. The
-  subscribed window and advisory topics are filtered after EMA and crossover
-  state updates, so subscriptions do not change calculations.
-- The normalized topic is the complete valid-event view. The housekeeping
-  topic makes initialization/housekeeping records explicit so their unusual
-  timestamps can be inspected without treating them as market-event time.
-- A row with a valid `Last` plus Ask/Bid values is one `trade` event; the
-  additional attributes are retained and are not treated as duplicate events.
-- `Last` values classify as `trade` events and contribute to
-  `valid_price_count`. Ask/Bid-only and empty payload rows are retained as
-  quote or housekeeping events. Quote events are included in analytical
-  windows but do not contribute to EMA prices; housekeeping events are
-  retained in the normalized/housekeeping views.
-- Zero-valued price fields in this dataset are treated as unavailable
-  placeholders: they remain in the original payload but do not qualify as
-  analytical prices. Negative, non-numeric, or non-finite price fields are
-  rejected with a reason code.
-
-The worker log records the configured topics, parallelism, connector, and
-lateness bound. Its consolidated progress lines contain counters for received,
-normalized, valid, rejected, analytical, late, and completed-window records,
-plus the current event-time watermark. Flink's metric group also contains
-counters for event type, exchange, and missing/invalid price records. For a small replay, compare the number and contents of
-window records against the CSV rows grouped by exchange-qualified symbol and
-five-minute local event-time interval.
-
-## Replay test runs
-
-Start the worker before each test with a fresh consumer group and the symbols
-you want to observe.
-
-```bash
+cd /home/jerry/SSDM
 source .venv311/bin/activate
-PYTHONPATH=code/Pipeline python code/Pipeline/streamworker.py \
-  --engine flink \
-  --broker localhost:9092 \
-  --flink-broker localhost:9092 \
-  --consumer-group trading-test-subscriptions-run1 \
-  --input-topics trading-events \
-  --starting-offsets earliest \
-  --parallelism 1 \
-  --lateness-seconds 60 \
-  --subscribed-symbols I2CET.FR,IGAGU.FR,ASML.NL,A0HN5C.ETR
-```
-Runs subscriptions across Paris, Amsterdam, and Frankfurt and includes symbols
-with valid trade windows and trade-free windows.
-
-```bash
-PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
-  --topic trading-events \
+source code/logs/current-run.env
+set -o pipefail
+python code/Pipeline/producer.py \
   --files data/debs2022-gc-trading-day-08-11-21.csv \
-  --max-rows 300000 \
-  --rate 1000
+  --max-rows 100000 \
+  --rate 1000 \
+  --topic-prefix "$PREFIX" \
+  --lateness-seconds "$DELAY" \
+  | tee "code/logs/$PREFIX/producer.jsonl"
 ```
-Runs a limited single-day correctness test at a baseline replay rate.
+
+After `DRAINED`, run this in Terminal 4.
 
 ```bash
-PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
-  --topic trading-events \
+python code/Pipeline/reference.py \
   --files data/debs2022-gc-trading-day-08-11-21.csv \
-  --max-rows 300000 \
-  --rate 5000
+  --max-rows 100000 \
+  --topic-prefix "$PREFIX" \
+  --subscribed-symbols INCAC.FR,INEUN.NL \
+  --check-kafka
 ```
-Replays the same dataset subset at moderate load for lag comparison.
+
+The checker should report two EMA results and two BUYs.
+
+## Test 1 · 50-row correctness fixture at 40 rows/s
+
+Replay the fixture with `ABC.FR` and `SPARSE.NL` subscribed. Small batches produce
+progress markers throughout the replay.
+
+### Terminal 1 · Start Kafka and prepare a fresh replay
+
+This creates a new prefix and saves it for the other terminals. Continue
+when the command prints `Replay prefix`.
 
 ```bash
-PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
-  --topic trading-events \
-  --files data/debs2022-gc-trading-day-08-11-21.csv \
-  --max-rows 300000 \
-  --rate 10000
+(
+  set -e
+  cd /home/jerry/SSDM
+  source .venv311/bin/activate
+  PREFIX="trading-events-$(date +%Y%m%d-%H%M%S-%N)"
+  DELAY=1
+  mkdir -p "code/logs/$PREFIX"
+  docker compose \
+    --file code/docker-compose.yml \
+    up \
+    --detach \
+    --wait \
+    kafka
+  python code/Pipeline/kafka_io.py \
+    --topic-prefix "$PREFIX"
+  printf 'export PREFIX=%q\nexport DELAY=%q\n' "$PREFIX" "$DELAY" > code/logs/current-run.env
+  printf 'Replay prefix %s\n' "$PREFIX"
+)
 ```
-Replays the same subset at realistic high-load pressure.
+
+### Terminal 2 · Start the Flink consumer
 
 ```bash
-PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
-  --topic trading-events \
-  --files data/debs2022-gc-trading-day-08-11-21.csv \
-  --skip-rows 100000 \
-  --max-rows 300000 \
-  --rate 5000
+cd /home/jerry/SSDM
+source .venv311/bin/activate
+source code/logs/current-run.env
+set -o pipefail
+PYTHONPATH="$PWD/code/Pipeline" python code/Pipeline/streamworker.py \
+  --topic-prefix "$PREFIX" \
+  --lateness-seconds "$DELAY" \
+  --rest-port 8082 \
+  --subscribed-symbols ABC.FR,SPARSE.NL \
+  2>&1 | tee "code/logs/$PREFIX/flink.log"
 ```
-Skips the first 100,000 rows of the file for a faster testing-only replay.
+
+### Terminal 3 · Follow the live logs
 
 ```bash
-PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
-  --topic trading-events \
+cd /home/jerry/SSDM
+source .venv311/bin/activate
+source code/logs/current-run.env
+python code/Pipeline/inspect_run.py \
+  --topic-prefix "$PREFIX"
+```
+
+### Terminal 4 · Run the producer
+
+```bash
+cd /home/jerry/SSDM
+source .venv311/bin/activate
+source code/logs/current-run.env
+set -o pipefail
+python code/Pipeline/producer.py \
+  --files code/Pipeline/fixtures/mixed.csv \
+  --rate 40 \
+  --chunksize 2 \
+  --progress-interval 0.05 \
+  --topic-prefix "$PREFIX" \
+  --lateness-seconds "$DELAY" \
+  | tee "code/logs/$PREFIX/producer.jsonl"
+```
+
+After `DRAINED`, run this in Terminal 4.
+
+```bash
+python code/Pipeline/reference.py \
+  --files code/Pipeline/fixtures/mixed.csv \
+  --topic-prefix "$PREFIX" \
+  --subscribed-symbols ABC.FR,SPARSE.NL \
+  --check-kafka
+```
+
+The checker should report 40 EMA results, three BUYs, and one SELL.
+
+## Test 2 · Two real files at 5,000 rows/s with parallelism 3
+
+Replay 500,000 rows from each of the November 8 and November 9 tick
+files. The skip and row limit apply per file, giving one million rows
+in total. The worker publishes results for `INCAC.FR` and `INEUN.NL`.
+
+### Terminal 1 · Start Kafka and prepare a fresh replay
+
+This creates a new prefix and saves it for the other terminals. Continue
+when the command prints `Replay prefix`.
+
+```bash
+(
+  set -e
+  cd /home/jerry/SSDM
+  source .venv311/bin/activate
+  PREFIX="trading-events-$(date +%Y%m%d-%H%M%S-%N)"
+  DELAY=1
+  mkdir -p "code/logs/$PREFIX"
+  docker compose \
+    --file code/docker-compose.yml \
+    up \
+    --detach \
+    --wait \
+    kafka
+  python code/Pipeline/kafka_io.py \
+    --topic-prefix "$PREFIX"
+  printf 'export PREFIX=%q\nexport DELAY=%q\n' "$PREFIX" "$DELAY" > code/logs/current-run.env
+  printf 'Replay prefix %s\n' "$PREFIX"
+)
+```
+
+### Terminal 2 · Start the Flink consumer
+
+```bash
+cd /home/jerry/SSDM
+source .venv311/bin/activate
+source code/logs/current-run.env
+set -o pipefail
+PYTHONPATH="$PWD/code/Pipeline" python code/Pipeline/streamworker.py \
+  --topic-prefix "$PREFIX" \
+  --lateness-seconds "$DELAY" \
+  --rest-port 8082 \
+  --parallelism 3 \
+  --subscribed-symbols INCAC.FR,INEUN.NL \
+  2>&1 | tee "code/logs/$PREFIX/flink.log"
+```
+
+### Terminal 3 · Follow the live logs
+
+```bash
+cd /home/jerry/SSDM
+source .venv311/bin/activate
+source code/logs/current-run.env
+python code/Pipeline/inspect_run.py \
+  --topic-prefix "$PREFIX"
+```
+
+### Terminal 4 · Run the producer
+
+```bash
+cd /home/jerry/SSDM
+source .venv311/bin/activate
+source code/logs/current-run.env
+set -o pipefail
+python code/Pipeline/producer.py \
   --files \
     data/debs2022-gc-trading-day-08-11-21.csv \
     data/debs2022-gc-trading-day-09-11-21.csv \
-  --subset 10 \
-  --rate 5000
+  --skip-rows 190000 \
+  --max-rows 500000 \
+  --rate 5000 \
+  --topic-prefix "$PREFIX" \
+  --lateness-seconds "$DELAY" \
+  | tee "code/logs/$PREFIX/producer.jsonl"
 ```
-Runs a limited two-day chronological replay at moderate load.
+
+After `DRAINED`, run this in Terminal 4.
 
 ```bash
-PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
-  --topic trading-events \
+python code/Pipeline/reference.py \
   --files \
     data/debs2022-gc-trading-day-08-11-21.csv \
     data/debs2022-gc-trading-day-09-11-21.csv \
-    data/debs2022-gc-trading-day-10-11-21.csv \
-    data/debs2022-gc-trading-day-11-11-21.csv \
-    data/debs2022-gc-trading-day-12-11-21.csv \
-    data/debs2022-gc-trading-day-13-11-21.csv \
-    data/debs2022-gc-trading-day-14-11-21.csv \
-  --subset 1 \
-  --rate 10000
+  --skip-rows 190000 \
+  --max-rows 500000 \
+  --topic-prefix "$PREFIX" \
+  --subscribed-symbols INCAC.FR,INEUN.NL \
+  --check-kafka
 ```
-Runs a 1-percent full-week subset at high load for cross-day and long-tail
-scalability evidence.
+
+The checker should report `"match": true` with zero mismatches.
+
+## Read the logs
+
+Compare several `PROGRESS` lines with `producer_state=replaying`. If
+`raw_backlog` keeps rising, Flink's decode stage is falling behind the producer.
+This estimate compares the latest producer acknowledgements with Flink's
+input counter. `lag_records` also includes event-time progress markers.
+Use `window_watermark` to follow progress through the window stage. Use
+the same files, skip, row limit, and worker flags when comparing producer rates.
+`DRAINED` confirms that the replay and its observed outputs reconcile.
+
+Each replay writes to `code/logs/$PREFIX/`.
+
+| File | What it shows |
+| --- | --- |
+| `ema.log` | Symbol, window end, close, EMA38, EMA100, and the source file and row |
+| `advisories.log` | BUY or SELL, window end, previous and current EMAs, and the crossover reason |
+| `diagnostics.log` | Samples of housekeeping, quotes, late prices, and rejected rows |
+| `worker.log` | Readiness, producer and Flink rates, lag, row counts, and drain |
+| `flink.log` | Flink startup output and errors |
+| `flink-worker-*-python-*.log` | Flink JVM task and Kafka connector errors |
+| `producer.jsonl` | Producer acknowledgements used by the inspector |
+
+Paste this in a spare terminal to watch the result and worker logs.
 
 ```bash
-PYTHONPATH=code/Pipeline python code/Pipeline/producer.py \
-  --topic trading-events \
-  --files data/debs2022-gc-trading-day-08-11-21.csv \
-  --max-rows 300000 \
-  --rate 0
+cd /home/jerry/SSDM
+source code/logs/current-run.env
+tail -F "code/logs/$PREFIX/"{ema,advisories,diagnostics,worker}.log
 ```
-Runs the maximum local burst to identify whether the laptop or PC is the
-limiting factor.
 
-For each replay, record the producer throughput and save the resulting values
-from `EMA_subscribed.log`, `advisories.log`, `lag_metrics.log`, and
-`streamworker_progress.jsonl`.
+If a run fails, check the first task exception in the Flink JVM log.
+An `IllegalArgumentException` at `SubTaskInitializationMetrics` line 49
+means the clock moved backward during Flink startup. If it keeps
+happening under WSL, finish any work in your WSL distributions and run
+`wsl --shutdown` from PowerShell. This stops all running distributions.
+Reopen Ubuntu and start again at Terminal 1 with a fresh prefix.

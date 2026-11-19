@@ -1,382 +1,331 @@
 #!/usr/bin/env python3
+"""Submit and run the two trading queries in PyFlink."""
 
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
-import threading
-import time
-import urllib.request
-import uuid
-from datetime import datetime, timezone
 
-from confluent_kafka.admin import AdminClient, NewTopic
-from confluent_kafka import Consumer, TopicPartition
+from pyflink.common import Configuration, Duration, Row, Types, WatermarkStrategy
+from pyflink.common.restart_strategy import RestartStrategies
+from pyflink.datastream import OutputTag, StreamExecutionEnvironment
+from pyflink.datastream.functions import KeyedProcessFunction, ProcessFunction
+from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from utils import get_json_logger
-
-
-DEFAULT_TOPIC = "trading-events"
-CONNECTOR_JAR_NAME = "flink-sql-connector-kafka-3.3.0-1.20.jar"
-CONNECTOR_JAR_URL = (
-    "https://repo1.maven.org/maven2/org/apache/flink/"
-    "flink-sql-connector-kafka/3.3.0-1.20/"
-    "flink-sql-connector-kafka-3.3.0-1.20.jar"
+from calculations import calculate_ema, detect_crossover
+from kafka_io import DEFAULT_PREFIX, INPUT_PARTITIONS, Topics, replay_source, result_sink
+from normalization import (
+    HOUSEKEEPING, MARKET_ZONES, PRICE, QUOTE, REJECTED, REJECT_REASONS, classify_row, load_subscriptions,
 )
-HEARTBEAT_INTERVAL_SECONDS = 15
-DEFAULT_PROGRESS_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "logs", "streamworker_progress.jsonl"
+from windowing import DEFAULT_LATENESS_SECONDS, WINDOW_MS, lateness_ms, window_end_ms, window_iso
+
+BUNDLED_CONNECTOR = Path(__file__).with_name("jars") / "flink-sql-connector-kafka-3.3.0-1.20.jar"
+
+PRICE_TYPE = Types.ROW_NAMED(
+    ["symbol", "trade_us", "source_index", "source_row", "close", "source_file"],
+    [Types.STRING(), Types.LONG(), Types.INT(), Types.LONG(), Types.DOUBLE(), Types.STRING()],
 )
+CANDIDATE_TYPE = Types.TUPLE([
+    Types.LONG(), Types.INT(), Types.LONG(), Types.DOUBLE(), Types.STRING(),
+])
+EMA_TYPE = Types.TUPLE([Types.DOUBLE(), Types.DOUBLE()])
+DIAGNOSTICS = OutputTag("diagnostics", Types.STRING())
+ADVISORIES = OutputTag("advisories", Types.STRING())
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the Trading Data Flink transport job")
-    parser.add_argument("--broker", default="localhost:9092")
-    parser.add_argument(
-        "--flink-broker",
-        default=os.getenv("FLINK_BROKER", "localhost:9092"),
-        help="Kafka address reachable by the Flink runtime (defaults to localhost:9092)",
-    )
-    parser.add_argument("--input-topics", default=DEFAULT_TOPIC)
-    parser.add_argument("--consumer-group", default="trading-flink-transport")
-    parser.add_argument("--starting-offsets", choices=["latest", "earliest"], default="latest")
-    parser.add_argument("--parallelism", type=int, default=1)
-    parser.add_argument("--engine", choices=["flink"], default="flink")
-    parser.add_argument("--dead-letter-topic", default="trading-events-dead-letter")
-    parser.add_argument("--late-topic", default="trading-events-late")
-    parser.add_argument("--window-topic", default="trading-events-windows")
-    parser.add_argument("--all-window-topic", default="trading-events-windows-all")
-    parser.add_argument("--advisory-topic", default="trading-events-advisories")
-    parser.add_argument("--subscribed-symbols", default=None)
-    parser.add_argument("--subscriptions-file", default=None)
-    parser.add_argument("--normalized-topic", default="trading-events-normalized")
-    parser.add_argument("--housekeeping-topic", default="trading-events-housekeeping")
-    parser.add_argument("--lateness-seconds", type=int, default=300)
-    parser.add_argument("--progress-file", default=DEFAULT_PROGRESS_FILE)
-    return parser.parse_args()
+class Counters:
+    def __init__(self, context, names):
+        metrics = context.get_metrics_group()
+        group = metrics.add_group("trading")
+        self.counts = dict.fromkeys(names, 0)
+        counters = {name: group.counter(name) for name in names}
+        reported = {}
+
+        def flush_counts():
+            for name, total in self.counts.items():
+                if total != reported.get(name):
+                    counters[name].inc(total - reported.get(name, 0))
+                    reported[name] = total
+            return 0
+
+        # PyFlink 1.20 evaluates gauge callbacks at bundle finish, inside Beam's
+        # metric scope. Publish counter deltas here so timer counts are included
+        # and reporting stays independent of gauge timestamps.
+        metrics.gauge("trading_counter_flush", flush_counts)
+
+    def inc(self, name):
+        self.counts[name] += 1
 
 
-def ensure_topics(broker: str, topics: list[str], logger) -> None:
-    names = sorted({topic.strip() for topic in topics if topic.strip()})
-    admin = AdminClient({"bootstrap.servers": broker})
-    existing = set(admin.list_topics(timeout=10).topics)
-    missing = [topic for topic in names if topic not in existing]
-    if not missing:
-        logger.info("Kafka topics ready", extra={"extra": {"topics": ",".join(names)}})
-        return
+class DiagnosticSamples:
+    def __init__(self, limit, counters):
+        self.limit = limit
+        self.counters = counters
+        self.samples = {}
 
-    futures = admin.create_topics(
-        [NewTopic(topic, num_partitions=3, replication_factor=1) for topic in missing],
-        request_timeout=15,
-    )
-    for topic, future in futures.items():
+    def record(self, kind, reason, record):
+        samples = self.samples.get(kind, 0)
+        if samples >= self.limit:
+            self.counters.inc(f"diagnostics_suppressed_{kind}")
+            return None
+        self.samples[kind] = samples + 1
+        self.counters.inc(f"diagnostics_sampled_{kind}")
+        return json.dumps({"kind": kind, "reason": reason, **{
+            key: value[:160] if isinstance(value, str) else value
+            for key, value in record.items()
+            if key in {
+                "symbol", "exchange", "sec_type", "last", "ask", "bid", "trade_us", "trade_clock",
+                "source_file", "source_index", "source_row", "window_end_ms", "watermark_ms",
+                "capture_date", "capture_time", "trading_date", "trading_time",
+            }
+            and (isinstance(value, (str, int, float)) or value is None)
+        }})
+
+
+def diagnostic_counters(*kinds):
+    return [f"diagnostics_{action}_{kind}" for kind in kinds for action in ("sampled", "suppressed")]
+
+
+class DecodeAndClassify(ProcessFunction):
+    def __init__(self, diagnostic_cap, delay_ms):
+        self.diagnostic_cap = diagnostic_cap
+        self.delay_ms = delay_ms
+
+    def open(self, context):
+        self.metrics = Counters(context, [
+            "raw_received", "progress_markers", "terminal_markers", "missing_trading_date_fallbacks",
+            HOUSEKEEPING, QUOTE, REJECTED,
+            *(f"reject_{reason}" for reason in REJECT_REASONS),
+            *diagnostic_counters(REJECTED, HOUSEKEEPING, QUOTE),
+        ])
+        self.diagnostics = DiagnosticSamples(self.diagnostic_cap, self.metrics)
+
+    def process_element(self, value, ctx):
         try:
-            future.result()
-        except Exception as exc:
-            if "already exists" not in str(exc).lower():
-                raise RuntimeError(f"Could not create Kafka topic {topic}: {exc}") from exc
-    logger.info("Kafka topics created", extra={"extra": {"topics": ",".join(missing)}})
-
-
-def ensure_connector_jar(logger) -> str:
-    override = os.getenv("FLINK_KAFKA_CONNECTOR_JAR", "").strip()
-    if override:
-        if not os.path.isfile(override):
-            raise RuntimeError(f"FLINK_KAFKA_CONNECTOR_JAR does not exist: {override}")
-        return os.path.abspath(override)
-
-    jar_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jars")
-    os.makedirs(jar_dir, exist_ok=True)
-    jar_path = os.path.join(jar_dir, CONNECTOR_JAR_NAME)
-    if not os.path.isfile(jar_path):
-        logger.info("Downloading Flink Kafka connector", extra={"extra": {"url": CONNECTOR_JAR_URL}})
-        temporary_path = f"{jar_path}.tmp"
-        urllib.request.urlretrieve(CONNECTOR_JAR_URL, temporary_path)
-        os.replace(temporary_path, jar_path)
-    return jar_path
-
-
-def start_heartbeat(logger) -> tuple[threading.Event, threading.Thread]:
-    stop_event = threading.Event()
-    started_at = time.monotonic()
-
-    def emit_heartbeat() -> None:
-        while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
-            logger.info(
-                "Streamworker is still running",
-                extra={
-                    "extra": {
-                        "elapsed_seconds": int(time.monotonic() - started_at),
-                    }
-                },
-            )
-
-    heartbeat = threading.Thread(
-        target=emit_heartbeat,
-        name="streamworker-heartbeat",
-        daemon=True,
-    )
-    heartbeat.start()
-    return stop_event, heartbeat
-
-
-def start_progress_reporter(
-    logger,
-    progress_file: str,
-    run_id: str,
-    broker: str,
-    consumer_group: str,
-    input_topics: list[str],
-) -> tuple[threading.Event, threading.Thread]:
-    stop_event = threading.Event()
-    progress_path = os.path.abspath(progress_file)
-    latest = {}
-
-    def emit_progress() -> None:
-        last_position = 0
-        kafka_consumer = Consumer({
-            "bootstrap.servers": broker,
-            "group.id": consumer_group,
-            "enable.auto.commit": False,
-        })
-
-        while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
-            snapshots = []
-            try:
-                with open(progress_path, encoding="utf-8") as file:
-                    file.seek(last_position)
-                    for line in file:
-                        try:
-                            snapshot = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if snapshot.get("run_id") == run_id:
-                            snapshots.append(snapshot)
-                    last_position = file.tell()
-            except FileNotFoundError:
-                snapshots = []
-
-            for snapshot in snapshots:
-                latest[(snapshot["stage"], snapshot["subtask"])] = snapshot
-            totals = {
-                "records_received": 0,
-                "records_normalized": 0,
-                "records_valid": 0,
-                "records_rejected": 0,
-                "analytical_records": 0,
-                "windows_emitted": 0,
-                "late_records": 0,
-            }
-            for snapshot in latest.values():
-                for key in (
-                    "records_received",
-                    "records_normalized",
-                    "records_valid",
-                    "records_rejected",
-                    "analytical_records",
-                    "windows_emitted",
-                    "late_records",
+            record = json.loads(value)
+        except (ValueError, TypeError):
+            record = {}
+            kind, close, reason = REJECTED, 0.0, "malformed_json"
+        else:
+            if isinstance(record, dict) and record.get("kind") == "progress":
+                frontier = record.get("frontier_ms")
+                terminal = record.get("terminal")
+                if (
+                    type(frontier) is not int or frontier != ctx.timestamp()
+                    or record.get("eligible_watermark_ms") != frontier - self.delay_ms - 1
+                    or type(terminal) is not bool
                 ):
-                    totals[key] = totals.get(key, 0) + snapshot.get(key, 0)
-            watermarks = [
-                snapshot["current_watermark"]
-                for snapshot in latest.values()
-                if snapshot.get("current_watermark") is not None
-            ]
-            extra = dict(totals)
-            extra["current_watermark"] = min(watermarks) if watermarks else "not_advanced"
-            records_per_second = [
-                snapshot["records_per_second"]
-                for snapshot in latest.values()
-                if snapshot.get("records_per_second") is not None
-            ]
-            windows_per_second = [
-                snapshot["windows_per_second"]
-                for snapshot in latest.values()
-                if snapshot.get("windows_per_second") is not None
-            ]
-            watermark_lags = [
-                snapshot["watermark_lag_ms"]
-                for snapshot in latest.values()
-                if snapshot.get("watermark_lag_ms") is not None
-            ]
-            average_latencies = [
-                snapshot["average_processing_latency_ms"]
-                for snapshot in latest.values()
-                if snapshot.get("average_processing_latency_ms") is not None
-            ]
-            max_latencies = [
-                snapshot["max_processing_latency_ms"]
-                for snapshot in latest.values()
-                if snapshot.get("max_processing_latency_ms") is not None
-            ]
-            p95_latencies = [
-                snapshot["p95_processing_latency_ms"]
-                for snapshot in latest.values()
-                if snapshot.get("p95_processing_latency_ms") is not None
-            ]
-            if records_per_second:
-                extra["records_per_second"] = round(max(records_per_second), 3)
-            if windows_per_second:
-                extra["windows_per_second"] = round(max(windows_per_second), 3)
-            if watermark_lags:
-                extra["watermark_lag_ms"] = max(watermark_lags)
-            if average_latencies:
-                extra["average_processing_latency_ms"] = round(max(average_latencies), 3)
-            if max_latencies:
-                extra["max_processing_latency_ms"] = round(max(max_latencies), 3)
-            if p95_latencies:
-                extra["p95_processing_latency_ms"] = round(max(p95_latencies), 3)
-            kafka_lag = 0
-            lag_available = False
-            try:
-                for topic in input_topics:
-                    metadata = kafka_consumer.list_topics(topic=topic, timeout=5)
-                    topic_metadata = metadata.topics.get(topic)
-                    if topic_metadata is None:
-                        continue
-                    partitions = [
-                        TopicPartition(topic, partition)
-                        for partition in topic_metadata.partitions
-                    ]
-                    if not partitions:
-                        continue
-                    committed = kafka_consumer.committed(partitions, timeout=5)
-                    for partition in committed:
-                        if partition.offset < 0:
-                            low, high = kafka_consumer.get_watermark_offsets(
-                                partition, timeout=5
-                            )
-                            kafka_lag += max(0, high)
-                            lag_available = True
-                            continue
-                        low, high = kafka_consumer.get_watermark_offsets(
-                            partition, timeout=5
-                        )
-                        kafka_lag += max(0, high - partition.offset)
-                        lag_available = True
-            except Exception as exc:
-                extra["kafka_lag_error"] = type(exc).__name__
-            if lag_available:
-                extra["kafka_consumer_lag"] = kafka_lag
-            else:
-                extra["kafka_consumer_lag"] = "not_available"
-            logger.info("Streamworker progress", extra={"extra": extra})
-            lag_log = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "logs",
-                "lag_metrics.log",
-            )
-            os.makedirs(os.path.dirname(lag_log), exist_ok=True)
-            lag_snapshot = {
-                "kind": "progress_lag",
-                "recorded_at": datetime.now(timezone.utc).isoformat(),
-                "run_id": run_id,
-                **extra,
-            }
-            with open(lag_log, "a", encoding="utf-8") as file:
-                file.write(safe_json_dumps(lag_snapshot) + "\n")
-        kafka_consumer.close()
+                    raise RuntimeError("progress marker timestamp or producer/worker watermark delay mismatch")
+                self.metrics.inc("progress_markers")
+                if terminal:
+                    self.metrics.inc("terminal_markers")
+                return
+            kind, close, reason = classify_row(record)
 
-    reporter = threading.Thread(
-        target=emit_progress,
-        name="streamworker-progress",
-        daemon=True,
-    )
-    reporter.start()
-    return stop_event, reporter
+        self.metrics.inc("raw_received")
+        if kind == PRICE:
+            if record["trade_clock"] == "capture_date_fallback":
+                self.metrics.inc("missing_trading_date_fallbacks")
+            yield Row(record["symbol"], record["trade_us"], record["source_index"],
+                      record["source_row"], close, record["source_file"])
+            return
+
+        self.metrics.inc(kind)
+        if kind == REJECTED:
+            self.metrics.inc(f"reject_{reason}")
+        sample = self.diagnostics.record(kind, reason, record if isinstance(record, dict) else {})
+        if sample is not None:
+            yield DIAGNOSTICS, sample
 
 
-def main() -> None:
-    args = parse_args()
-    if args.parallelism < 1:
-        raise SystemExit("--parallelism must be at least 1")
-    if args.lateness_seconds < 0:
-        raise SystemExit("--lateness-seconds must not be negative")
+class PriceWindows(KeyedProcessFunction):
+    def __init__(self, run_id, subscriptions, diagnostic_cap):
+        self.run_id = run_id
+        self.subscriptions = subscriptions
+        self.diagnostic_cap = diagnostic_cap
 
-    logger = get_json_logger("streamworker", "trading")
-    run_id = uuid.uuid4().hex
-    progress_file = os.path.abspath(args.progress_file)
-    os.makedirs(os.path.dirname(progress_file), exist_ok=True)
-    with open(progress_file, "w", encoding="utf-8"):
-        pass
-    topics = [topic.strip() for topic in args.input_topics.split(",") if topic.strip()]
-    if not topics:
-        raise SystemExit("--input-topics must contain at least one topic")
-    from subscriptions import load_subscriptions
-
-    try:
-        args.subscribed_symbols = load_subscriptions(
-            args.subscribed_symbols, args.subscriptions_file
+    def open(self, context):
+        self.open_windows = context.get_map_state(
+            MapStateDescriptor("open-price-windows", Types.LONG(), CANDIDATE_TYPE)
         )
-    except ValueError as exc:
-        raise SystemExit(str(exc)) from exc
-    ensure_topics(
-        args.broker,
-        topics + [
-            args.dead_letter_topic,
-            args.late_topic,
-            args.window_topic,
-            args.all_window_topic,
-            args.advisory_topic,
-            args.normalized_topic,
-            args.housekeeping_topic,
-        ],
-        logger,
-    )
-    connector_jar = ensure_connector_jar(logger)
-    from ema import prepare_ema_log, prepare_lag_log, prepare_output_logs
+        self.ema = context.get_state(ValueStateDescriptor("previous-emas", EMA_TYPE))
+        self.metrics = Counters(context, [
+            "price_accepted", "price_late", "price_windows_completed", "ema_published",
+            "buy_published", "sell_published",
+            *(f"price_accepted_{exchange}" for exchange in MARKET_ZONES),
+            *diagnostic_counters("price_late"),
+        ])
+        self.diagnostics = DiagnosticSamples(self.diagnostic_cap, self.metrics)
 
-    ema_log = prepare_ema_log()
-    subscribed_ema_log, advisory_log = prepare_output_logs()
-    lag_log = prepare_lag_log()
-    logger.info(
-        "Streamworker configuration ready",
-        extra={
-            "extra": {
-                "broker": args.broker,
-                "flink_broker": args.flink_broker,
-                "input_topics": ",".join(topics),
-                "consumer_group": args.consumer_group,
-                "starting_offsets": args.starting_offsets,
-                "parallelism": args.parallelism,
-                "lateness_seconds": args.lateness_seconds,
-                "connector_jar": connector_jar,
-                "ema_log": ema_log,
-                "subscribed_ema_log": subscribed_ema_log,
-                "advisory_log": advisory_log,
-                "lag_log": lag_log,
-                "progress_file": progress_file,
-                "subscriptions": (
-                    "unfiltered"
-                    if args.subscribed_symbols is None
-                    else ",".join(sorted(args.subscribed_symbols))
-                ),
-            }
-        },
-    )
+    def process_element(self, value, ctx):
+        symbol, trade_us, source_index, source_row, close, source_file = value
+        end = window_end_ms(trade_us)
+        timer = ctx.timer_service()
+        watermark = timer.current_watermark()
+        if watermark >= end:
+            self.metrics.inc("price_late")
+            sample = self.diagnostics.record("price_late", "window_already_final", {
+                "symbol": symbol, "trade_us": trade_us, "source_file": source_file,
+                "source_index": source_index, "source_row": source_row, "last": close,
+                "window_end_ms": end, "watermark_ms": watermark,
+            })
+            if sample is not None:
+                yield DIAGNOSTICS, sample
+            return
 
-    from streamworker_flink import run_flink_worker
+        self.metrics.inc("price_accepted")
+        self.metrics.inc(f"price_accepted_{symbol.rsplit('.', 1)[1]}")
+        candidate = self.open_windows.get(end)
+        order = (trade_us, source_index, source_row)
+        if candidate is None:
+            timer.register_event_time_timer(end)
+        if candidate is None or order > candidate[:3]:
+            self.open_windows.put(end, (*order, close, source_file))
 
-    logger.info("Starting Flink normalization, windowing, and EMA stages")
-    heartbeat_stop, heartbeat = start_heartbeat(logger)
-    progress_stop, progress_reporter = start_progress_reporter(
-        logger,
-        progress_file,
-        run_id,
-        args.broker,
-        args.consumer_group,
-        topics,
-    )
+    def on_timer(self, timestamp, ctx):
+        trade_us, source_index, source_row, close, source_file = self.open_windows.get(timestamp)
+        self.open_windows.remove(timestamp)
+        previous38, previous100 = self.ema.value() or (0.0, 0.0)
+        ema38 = calculate_ema(close, previous38, 38)
+        ema100 = calculate_ema(close, previous100, 100)
+        self.ema.update((ema38, ema100))
+        advice = detect_crossover(previous38, previous100, ema38, ema100)
+        self.metrics.inc("price_windows_completed")
+
+        symbol = ctx.get_current_key()
+        if self.subscriptions is not None and symbol not in self.subscriptions:
+            return
+
+        zone = MARKET_ZONES[symbol.rsplit(".", 1)[1]]
+        identity = f"{self.run_id}:{symbol}:{timestamp}"
+        result = {
+            "run_id": self.run_id, "symbol": symbol,
+            "window_start": window_iso(timestamp - WINDOW_MS, zone),
+            "window_end": window_iso(timestamp, zone),
+            "window_end_ms": timestamp, "close": close, "ema38": ema38, "ema100": ema100,
+        }
+        self.metrics.inc("ema_published")
+        yield json.dumps({
+            **result, "kind": "ema", "result_id": f"{identity}:ema",
+            "trade_us": trade_us, "source_file": source_file,
+            "source_index": source_index, "source_row": source_row,
+        })
+        if advice:
+            self.metrics.inc(f"{advice}_published")
+            yield ADVISORIES, json.dumps({
+                **result, "kind": "advisory", "result_id": f"{identity}:{advice}",
+                "advice": advice.upper(), "previous_ema38": previous38, "previous_ema100": previous100,
+                "reason": "bullish_crossover" if advice == "buy" else "bearish_crossover",
+            })
+
+
+def build_pipeline(env, args):
+    topics = Topics.from_prefix(args.topic_prefix)
+    source = replay_source(args.broker, topics)
+    # With no idle timeout, an empty partition participates as soon as its startup
+    # marker arrives. Later progress is ordered behind its queued rows and markers.
+    watermarks = WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_millis(args.delay_ms))
+    prices = env.from_source(source, watermarks, "kafka-replay-source").process(
+        DecodeAndClassify(args.diagnostic_cap, args.delay_ms), output_type=PRICE_TYPE,
+    ).name("decode-classify")
+    results = prices.key_by(lambda row: row[0], key_type=Types.STRING()).process(
+        PriceWindows(args.topic_prefix, args.subscribed_symbols, args.diagnostic_cap),
+        output_type=Types.STRING(),
+    ).name("price-windows-ema-crossover")
+
+    results.sink_to(result_sink(args.broker, topics.windows)).name("ema-kafka-sink")
+    results.get_side_output(ADVISORIES).sink_to(
+        result_sink(args.broker, topics.advisories)
+    ).name("advisory-kafka-sink")
+    prices.get_side_output(DIAGNOSTICS).union(results.get_side_output(DIAGNOSTICS)).sink_to(
+        result_sink(args.broker, topics.diagnostics)
+    ).name("diagnostics-kafka-sink")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--broker", "--flink-broker", default="localhost:9092")
+    parser.add_argument("--topic-prefix", default=DEFAULT_PREFIX)
+    parser.add_argument("--parallelism", type=int, default=1)
+    parser.add_argument("--subscribed-symbols")
+    parser.add_argument("--subscriptions-file")
+    parser.add_argument("--lateness-seconds", type=float, default=DEFAULT_LATENESS_SECONDS)
+    parser.add_argument("--diagnostic-cap", type=int, default=20)
+    parser.add_argument("--watermark-interval-ms", type=int, default=100)
+    parser.add_argument("--bundle-time-ms", type=int, default=100)
+    parser.add_argument("--bundle-size", type=int, default=1000)
+    parser.add_argument("--rest-port", type=int, help="Expose local Flink job metrics on this loopback port")
+    parser.add_argument("--connector-jar", type=Path, default=os.getenv("FLINK_KAFKA_CONNECTOR_JAR"))
+    parser.add_argument("--print-plan", action="store_true")
+    args = parser.parse_args()
     try:
-        args.run_id = run_id
-        run_flink_worker(args, connector_jar, logger, progress_file, run_id)
-    finally:
-        heartbeat_stop.set()
-        progress_stop.set()
-        heartbeat.join(timeout=HEARTBEAT_INTERVAL_SECONDS)
-        progress_reporter.join(timeout=HEARTBEAT_INTERVAL_SECONDS)
+        Topics.from_prefix(args.topic_prefix)
+        args.delay_ms = lateness_ms(args.lateness_seconds)
+        args.subscribed_symbols = load_subscriptions(args.subscribed_symbols, args.subscriptions_file)
+        if not 1 <= args.parallelism <= INPUT_PARTITIONS or args.diagnostic_cap < 0:
+            raise ValueError(f"parallelism must be 1–{INPUT_PARTITIONS} and diagnostic cap non-negative")
+        if min(args.bundle_time_ms, args.bundle_size, args.watermark_interval_ms) < 1:
+            raise ValueError("bundle size, bundle time and watermark interval must be positive")
+        if args.rest_port is not None and not 1 <= args.rest_port <= 65535:
+            raise ValueError("--rest-port must be between 1 and 65535")
+        if args.connector_jar is not None and not args.connector_jar.is_file():
+            raise ValueError(f"Kafka connector jar does not exist: {args.connector_jar}")
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
+
+
+def main():
+    args = parse_args()
+    local = "PYFLINK_GATEWAY_PORT" not in os.environ
+    if local and not args.print_plan and "FLINK_LOG_DIR" not in os.environ:
+        log_dir = Path(__file__).resolve().parents[1] / "logs" / args.topic_prefix
+        log_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["FLINK_LOG_DIR"] = str(log_dir)
+        os.environ.setdefault("FLINK_IDENT_STRING", f"worker-{os.getpid()}")
+
+    config = Configuration()
+    if args.rest_port is not None:
+        if not local:
+            raise SystemExit("With flink run, use the cluster's configured REST endpoint.")
+        config.set_integer("rest.port", args.rest_port)
+        config.set_string("rest.bind-port", str(args.rest_port))
+        config.set_string("rest.bind-address", "127.0.0.1")
+        config.set_string("metrics.fetcher.update-interval", "1 s")
+    env = StreamExecutionEnvironment.get_execution_environment(config)
+    env.set_parallelism(args.parallelism)
+    env.set_restart_strategy(RestartStrategies.no_restart())
+    env.set_python_executable(sys.executable)
+    env.get_config().set_auto_watermark_interval(args.watermark_interval_ms)
+    subscriptions = (
+        "all symbols" if args.subscribed_symbols is None
+        else ",".join(sorted(args.subscribed_symbols)) or "no published symbols"
+    )
+    env.get_config().set_global_job_parameters({
+        "trading.topic_prefix": args.topic_prefix,
+        "trading.subscriptions": subscriptions,
+    })
+    config.set_integer("python.fn-execution.bundle.size", args.bundle_size)
+    config.set_string("python.fn-execution.bundle.time", str(args.bundle_time_ms))
+    env.configure(config)
+    connector = args.connector_jar or BUNDLED_CONNECTOR
+    if local:
+        if connector.is_file():
+            env.add_jars(connector.resolve().as_uri())
+    elif args.connector_jar is not None:
+        raise SystemExit("With flink run, install the connector in the Flink lib directory.")
+
+    build_pipeline(env, args)
+    if args.print_plan:
+        print(env.get_execution_plan())
+        return
+    print(f"Submitting {args.topic_prefix} to Flink with parallelism {args.parallelism}, "
+          f"Kafka {args.broker}, event-time delay {args.delay_ms} ms, subscriptions {subscriptions}",
+          flush=True)
+    if local and "FLINK_LOG_DIR" in os.environ:
+        print(f"Flink JVM logs: {os.environ['FLINK_LOG_DIR']}", flush=True)
+    env.execute(f"trading-replay:{args.topic_prefix}")
 
 
 if __name__ == "__main__":

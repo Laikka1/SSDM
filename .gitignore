@@ -27,6 +27,7 @@ share/python-wheels/
 MANIFEST
 data/
 *.csv
+!code/Pipeline/fixtures/mixed.csv
 
 # PyInstaller
 #   Usually these files are written by a python script from a template
