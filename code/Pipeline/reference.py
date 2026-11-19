@@ -96,6 +96,7 @@ def batch_reference(args):
             sides[side] += 1
             emitted[f"{base_id}:{side.lower()}"] = dict(
                 base, kind="advisory", advice=side, previous_ema38=previous38, previous_ema100=previous100,
+                reason="bullish_crossover" if side == "BUY" else "bearish_crossover",
             )
 
     return emitted, {

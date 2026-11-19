@@ -46,7 +46,7 @@ class ResultLogs:
         self.files = {}
         self.last_offset = {}
         self.counts = Counter()
-        for topic, filename in zip(topics.outputs(), ("ema.log", "advisories.log", "diagnostics.log")):
+        for topic, filename in ((topics.windows, "ema.log"), (topics.advisories, "advisories.log")):
             file = stack.enter_context((directory / filename).open("a+", buffering=1, encoding="utf-8"))
             file.seek(0)
             last = deque(file, maxlen=1)
@@ -55,23 +55,22 @@ class ResultLogs:
 
     def record(self, message):
         topic = message.topic()
-        row = json.loads(message.value())
         if topic == self.topics.diagnostics:
             self.counts["diagnostics"] += 1
-            details = {"type": row["kind"], "reason": row["reason"]}
-            details.update({key: value for key, value in row.items() if key not in ("kind", "reason")})
+            return
+
+        row = json.loads(message.value())
+        result = "EMA" if topic == self.topics.windows else row["advice"]
+        self.counts[result] += 1
+        details = {
+            "type": result, "symbol": row["symbol"], "window_end": row["window_end"],
+            "close": row["close"], "EMA38": row["ema38"], "EMA100": row["ema100"],
+        }
+        if result == "EMA":
+            details.update(source_file=row["source_file"], source_row=row["source_row"])
         else:
-            result = "EMA" if topic == self.topics.windows else row["advice"]
-            self.counts[result] += 1
-            details = {
-                "type": result, "symbol": row["symbol"], "window_end": row["window_end"],
-                "close": row["close"], "EMA38": row["ema38"], "EMA100": row["ema100"],
-            }
-            if result == "EMA":
-                details.update(source_file=row["source_file"], source_row=row["source_row"])
-            else:
-                details.update(previous_EMA38=row["previous_ema38"], previous_EMA100=row["previous_ema100"],
-                               reason=row["reason"])
+            details.update(previous_EMA38=row["previous_ema38"], previous_EMA100=row["previous_ema100"],
+                           reason=row["reason"])
         offset = message.offset()
         if offset > self.last_offset[topic]:
             print(f"{timestamp()} offset={offset}  {fields(details)}", file=self.files[topic])
@@ -205,17 +204,9 @@ class Flink:
         return offsets, counts, watermark
 
 
-def progress_fields(offsets, ends, counts, watermark, journal, previous, observed):
-    now = time.monotonic()
+def progress_fields(offsets, ends, counts, watermark, journal, observed):
     acked = journal.latest["raw_acked"] if journal.latest else None
     raw_read = counts.get("raw_received")
-
-    rates = {"producer_rows_s": UNAVAILABLE, "flink_rows_s": UNAVAILABLE}
-    if previous:
-        elapsed = now - previous[0]
-        for key, current, old in (("producer_rows_s", acked, previous[1]), ("flink_rows_s", raw_read, previous[2])):
-            if elapsed > 0 and current is not None and old is not None and current >= old:
-                rates[key] = f"{(current - old) / elapsed:.1f}"
 
     lag = {p: ends[p] - offset for p, offset in offsets.items() if p in ends}
     lag_available = len(lag) == INPUT_PARTITIONS and min(lag.values()) >= 0
@@ -234,20 +225,15 @@ def progress_fields(offsets, ends, counts, watermark, journal, previous, observe
         "raw_acked": acked if acked is not None else UNAVAILABLE,
         "raw_read": raw_read if raw_read is not None else UNAVAILABLE,
         "raw_backlog": raw_backlog if raw_backlog is not None and raw_backlog >= 0 else UNAVAILABLE,
-        **rates,
         **{kind: counts.get(kind, UNAVAILABLE) for kind in TERMINAL_CLASSES},
         "price_windows": counts.get("price_windows_completed", UNAVAILABLE),
         "ema": observed["EMA"], "buy": observed["BUY"], "sell": observed["SELL"],
-        "diagnostics_sampled": observed["diagnostics"],
-        "diagnostics_suppressed": sum(value for key, value in counts.items()
-                                      if key.startswith("diagnostics_suppressed_")) if counts else UNAVAILABLE,
-        "terminal_markers": counts.get("terminal_markers", UNAVAILABLE),
         "window_watermark": (
             datetime.fromtimestamp(watermark / 1000, timezone.utc).isoformat(timespec="milliseconds")
             if watermark is not None and watermark > -(2 ** 63) else UNAVAILABLE
         ),
     }
-    return total, sample, (now, acked, raw_read)
+    return total, sample
 
 
 def terminal_partitions_read(journal, offsets):
@@ -290,7 +276,6 @@ def monitor(args, topics, results, worker_log):
     last_job_seen = started
     next_sample = started
     announced = ready = False
-    previous = None
     log("WAITING", prefix=topics.input, flink_rest=args.rest_url, broker=args.broker)
 
     try:
@@ -338,12 +323,11 @@ def monitor(args, topics, results, worker_log):
                     if not ready and job["state"] == "RUNNING" and len(offsets) == len(ends) == INPUT_PARTITIONS:
                         log("READY", job_id=flink.job_id, prefix=topics.input, partitions=INPUT_PARTITIONS)
                         ready = True
-                    lag, sample, previous = progress_fields(
-                        offsets, ends, counts, watermark, journal, previous, results.counts,
+                    lag, sample = progress_fields(
+                        offsets, ends, counts, watermark, journal, results.counts,
                     )
                     terminal_reads = terminal_partitions_read(journal, offsets)
                     sample["terminal_partitions_read"] = f"{terminal_reads}/{INPUT_PARTITIONS}"
-                    sample["elapsed_s"] = f"{time.monotonic() - started:.1f}"
                     if drained(journal, lag, terminal_reads, counts, watermark, results.counts):
                         log("DRAINED", **sample)
                         return 0
@@ -352,7 +336,6 @@ def monitor(args, topics, results, worker_log):
                 log("FAILED", job_id=flink.job_id, error=exc, details="Check the Flink logs for this replay.")
                 return 1
             except (URLError, TimeoutError, KafkaException) as exc:
-                previous = None
                 log("UNAVAILABLE", lag_records=UNAVAILABLE, error=exc)
 
             now = time.monotonic()

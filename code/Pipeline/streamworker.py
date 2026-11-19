@@ -2,6 +2,7 @@
 """Submit and run the two trading queries in PyFlink."""
 
 import argparse
+from functools import partial
 import json
 import os
 from pathlib import Path
@@ -9,16 +10,19 @@ import sys
 
 from pyflink.common import Configuration, Duration, Row, Types, WatermarkStrategy
 from pyflink.common.restart_strategy import RestartStrategies
-from pyflink.datastream import OutputTag, StreamExecutionEnvironment
+from pyflink.datastream import CheckpointingMode, DataStream, OutputTag, StreamExecutionEnvironment
 from pyflink.datastream.functions import KeyedProcessFunction, ProcessFunction
 from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
+from pyflink.java_gateway import get_gateway
 
-from calculations import calculate_ema, detect_crossover
+from calculations import (
+    DEFAULT_LATENESS_SECONDS, WINDOW_MS, calculate_ema, detect_crossover,
+    lateness_ms, window_end_ms, window_iso,
+)
 from kafka_io import DEFAULT_PREFIX, INPUT_PARTITIONS, Topics, replay_source, result_sink
 from normalization import (
     HOUSEKEEPING, MARKET_ZONES, PRICE, QUOTE, REJECTED, REJECT_REASONS, classify_row, load_subscriptions,
 )
-from windowing import DEFAULT_LATENESS_SECONDS, WINDOW_MS, lateness_ms, window_end_ms, window_iso
 
 BUNDLED_CONNECTOR = Path(__file__).with_name("jars") / "flink-sql-connector-kafka-3.3.0-1.20.jar"
 
@@ -222,24 +226,37 @@ class PriceWindows(KeyedProcessFunction):
 
 def build_pipeline(env, args):
     topics = Topics.from_prefix(args.topic_prefix)
-    source = replay_source(args.broker, topics)
+    recoverable = args.recoverable_replay is not None
+    source = replay_source(args.broker, topics, bounded=recoverable, request_timeout_ms=args.kafka_request_timeout_ms)
+    sink = partial(result_sink, args.broker, transactional=recoverable,
+                   request_timeout_ms=args.kafka_request_timeout_ms)
     # With no idle timeout, an empty partition participates as soon as its startup
     # marker arrives. Later progress is ordered behind its queued rows and markers.
     watermarks = WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_millis(args.delay_ms))
     prices = env.from_source(source, watermarks, "kafka-replay-source").process(
         DecodeAndClassify(args.diagnostic_cap, args.delay_ms), output_type=PRICE_TYPE,
     ).name("decode-classify")
-    results = prices.key_by(lambda row: row[0], key_type=Types.STRING()).process(
-        PriceWindows(args.topic_prefix, args.subscribed_symbols, args.diagnostic_cap),
-        output_type=Types.STRING(),
-    ).name("price-windows-ema-crossover")
+    if args.jvm_window_jar is None:
+        results = prices.key_by(lambda row: row[0], key_type=Types.STRING()).process(
+            PriceWindows(args.topic_prefix, args.subscribed_symbols, args.diagnostic_cap),
+            output_type=Types.STRING(),
+        )
+    else:
+        gateway = get_gateway()
+        subscriptions = None
+        if args.subscribed_symbols is not None:
+            subscriptions = gateway.new_array(gateway.jvm.java.lang.String, len(args.subscribed_symbols))
+            for index, symbol in enumerate(sorted(args.subscribed_symbols)):
+                subscriptions[index] = symbol
+        results = DataStream(gateway.jvm.ssdm.PriceWindows.apply(
+            prices._j_data_stream, args.topic_prefix, subscriptions, args.diagnostic_cap,
+        ))
+    results.name("price-windows-ema-crossover")
 
-    results.sink_to(result_sink(args.broker, topics.windows)).name("ema-kafka-sink")
-    results.get_side_output(ADVISORIES).sink_to(
-        result_sink(args.broker, topics.advisories)
-    ).name("advisory-kafka-sink")
+    results.sink_to(sink(topics.windows)).name("ema-kafka-sink")
+    results.get_side_output(ADVISORIES).sink_to(sink(topics.advisories)).name("advisory-kafka-sink")
     prices.get_side_output(DIAGNOSTICS).union(results.get_side_output(DIAGNOSTICS)).sink_to(
-        result_sink(args.broker, topics.diagnostics)
+        sink(topics.diagnostics)
     ).name("diagnostics-kafka-sink")
 
 
@@ -255,6 +272,11 @@ def parse_args():
     parser.add_argument("--watermark-interval-ms", type=int, default=100)
     parser.add_argument("--bundle-time-ms", type=int, default=100)
     parser.add_argument("--bundle-size", type=int, default=1000)
+    parser.add_argument("--recoverable-replay", type=Path, metavar="CHECKPOINT_DIR",
+                        help="Read an already-produced replay to its current end offsets with Kafka transactions")
+    parser.add_argument("--checkpoint-interval-ms", type=int, default=1000)
+    parser.add_argument("--jvm-window-jar", type=Path, help="Use the JVM keyed window operator from this JAR")
+    parser.add_argument("--kafka-request-timeout-ms", type=int, help="Override the worker's Kafka request timeout")
     parser.add_argument("--rest-port", type=int, help="Expose local Flink job metrics on this loopback port")
     parser.add_argument("--connector-jar", type=Path, default=os.getenv("FLINK_KAFKA_CONNECTOR_JAR"))
     parser.add_argument("--print-plan", action="store_true")
@@ -265,12 +287,16 @@ def parse_args():
         args.subscribed_symbols = load_subscriptions(args.subscribed_symbols, args.subscriptions_file)
         if not 1 <= args.parallelism <= INPUT_PARTITIONS or args.diagnostic_cap < 0:
             raise ValueError(f"parallelism must be 1–{INPUT_PARTITIONS} and diagnostic cap non-negative")
-        if min(args.bundle_time_ms, args.bundle_size, args.watermark_interval_ms) < 1:
-            raise ValueError("bundle size, bundle time and watermark interval must be positive")
+        if min(args.bundle_time_ms, args.bundle_size, args.watermark_interval_ms, args.checkpoint_interval_ms) < 1:
+            raise ValueError("bundle size, bundle time, watermark and checkpoint intervals must be positive")
         if args.rest_port is not None and not 1 <= args.rest_port <= 65535:
             raise ValueError("--rest-port must be between 1 and 65535")
         if args.connector_jar is not None and not args.connector_jar.is_file():
             raise ValueError(f"Kafka connector jar does not exist: {args.connector_jar}")
+        if args.jvm_window_jar is not None and not args.jvm_window_jar.is_file():
+            raise ValueError(f"JVM window operator jar does not exist: {args.jvm_window_jar}")
+        if args.kafka_request_timeout_ms is not None and not 1 <= args.kafka_request_timeout_ms <= 600_000:
+            raise ValueError("Kafka request timeout must be between 1 and 600000 ms")
     except ValueError as exc:
         parser.error(str(exc))
     return args
@@ -295,7 +321,12 @@ def main():
         config.set_string("metrics.fetcher.update-interval", "1 s")
     env = StreamExecutionEnvironment.get_execution_environment(config)
     env.set_parallelism(args.parallelism)
-    env.set_restart_strategy(RestartStrategies.no_restart())
+    if args.recoverable_replay is None:
+        env.set_restart_strategy(RestartStrategies.no_restart())
+    else:
+        env.enable_checkpointing(args.checkpoint_interval_ms, CheckpointingMode.EXACTLY_ONCE)
+        env.get_checkpoint_config().set_checkpoint_storage_dir(args.recoverable_replay.resolve().as_uri())
+        env.set_restart_strategy(RestartStrategies.fixed_delay_restart(2, 1000))
     env.set_python_executable(sys.executable)
     env.get_config().set_auto_watermark_interval(args.watermark_interval_ms)
     subscriptions = (
@@ -315,6 +346,8 @@ def main():
             env.add_jars(connector.resolve().as_uri())
     elif args.connector_jar is not None:
         raise SystemExit("With flink run, install the connector in the Flink lib directory.")
+    if args.jvm_window_jar is not None:
+        env.add_jars(args.jvm_window_jar.resolve().as_uri())
 
     build_pipeline(env, args)
     if args.print_plan:

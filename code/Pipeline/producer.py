@@ -14,9 +14,9 @@ import sys
 from tempfile import NamedTemporaryFile
 import time
 
+from calculations import DEFAULT_LATENESS_SECONDS, lateness_ms, window_end_ms
 from kafka_io import DEFAULT_PREFIX, INPUT_PARTITIONS, Topics, create_producer, enqueue, verify_empty_topics
 from normalization import PRICE, TERMINAL_CLASSES, classify_row, project_row
-from windowing import DEFAULT_LATENESS_SECONDS, lateness_ms, window_end_ms
 
 REQUIRED_FIELDS = {"SecType", "Date", "Time", "Last", "Ask", "Bid", "Trading date", "Trading time"}
 INITIAL_PROGRESS_MS = 1  # Kafka clients use a zero timestamp to mean wall-clock time.
@@ -110,7 +110,6 @@ def prepare_order(args):
     destination = args.prepare_order
     if destination.exists():
         raise ValueError(f"ordered replay already exists: {destination}")
-    started = time.monotonic()
     with NamedTemporaryFile(dir=destination.parent, prefix=".replay-") as temporary:
         with sqlite3.connect(temporary.name) as db:
             db.execute("CREATE TABLE replay (sequence INTEGER PRIMARY KEY, sort_us INTEGER, payload TEXT)")
@@ -118,8 +117,7 @@ def prepare_order(args):
             db.execute("CREATE INDEX replay_order ON replay(sort_us, sequence)")
             count = db.execute("SELECT count(*) FROM replay").fetchone()[0]
         os.link(temporary.name, destination)
-    return {"raw_rows": count, "preparation_s": time.monotonic() - started,
-            "ordered_db_bytes": destination.stat().st_size}
+    return {"raw_rows": count, "ordered_db_bytes": destination.stat().st_size}
 
 
 def _ordered_payloads(args):
@@ -135,9 +133,7 @@ def _ordered_payloads(args):
 
 
 def report(event, **fields):
-    print(json.dumps({
-        "event": event, "wall_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(), **fields,
-    }), flush=True)
+    print(json.dumps({"event": event, **fields}), flush=True)
 
 
 class Delivery:
@@ -154,9 +150,10 @@ class Delivery:
             self.raw_acked += 1
         else:
             self.markers_acked += 1
-            marker["offsets"][msg.partition()] = msg.offset()
-            if len(marker["offsets"]) == INPUT_PARTITIONS:
-                report("progress_acked", **marker)
+            if marker["terminal"]:
+                marker["offsets"][msg.partition()] = msg.offset()
+                if len(marker["offsets"]) == INPUT_PARTITIONS:
+                    report("progress_acked", **marker)
 
     def check(self):
         if self.failed:
@@ -171,10 +168,11 @@ class Delivery:
 def send_progress(producer, delivery, topic, timestamp_ms, delay_ms, *, terminal=False):
     marker = {
         "frontier_ms": timestamp_ms, "eligible_watermark_ms": timestamp_ms - delay_ms - 1,
-        "sent_wall_ns": time.time_ns(), "sent_monotonic_ns": time.monotonic_ns(), "terminal": terminal,
+        "terminal": terminal,
     }
     value = json.dumps({"kind": "progress", **marker}, separators=(",", ":")).encode()
-    marker["offsets"] = {}
+    if terminal:
+        marker["offsets"] = {}
     for partition in range(INPUT_PARTITIONS):
         enqueue(
             producer, delivery, topic=topic, value=value,
@@ -195,8 +193,7 @@ def run_replay(args, topics, expected):
         # Open the input and apply --skip-rows before starting the replay clock.
         batch = list(islice(records, args.chunksize))
         started = last_marker = last_report = time.monotonic()
-        report("replay_started", topic=topics.input, target_rows_s=args.rate, delay_ms=delay,
-               producer_pid=os.getpid(), **delivery.counts())
+        report("replay_started", topic=topics.input, target_rows_s=args.rate, delay_ms=delay, **delivery.counts())
         try:
             send_progress(producer, delivery, topics.input, advertised, delay)
             while batch:
@@ -206,12 +203,10 @@ def run_replay(args, topics, expected):
                         time.sleep(min(remaining, 0.05))
                         producer.poll(0)
                         delivery.check()
-                batch_wall_ns = time.time_ns()
                 for record in batch:
                     kind, _, _ = classify_row(record)
                     if kind == PRICE:
                         frontier = max(frontier, record["trade_us"])
-                    record["replay_wall_ns"] = batch_wall_ns
                     key = record["symbol"] or f'{record["source_index"]}:{record["source_row"]}'
                     enqueue(
                         producer, delivery, topic=topics.input, key=key.encode(),
@@ -243,9 +238,7 @@ def run_replay(args, topics, expected):
             report("replay_failed", pending=pending, last_error=delivery.last_error, **delivery.counts())
             raise
 
-    elapsed = time.monotonic() - started
-    report("replay_finished", elapsed_s=elapsed, acknowledged_rows_s=delivery.raw_acked / elapsed,
-           **delivery.counts())
+    report("replay_finished", **delivery.counts())
 
 
 def parse_args():
@@ -290,9 +283,8 @@ def main():
         report("order_prepared", **prepare_order(args))
         return
 
-    started = time.monotonic()
     expected = preflight(projected_rows(args))
-    report("preflight", elapsed_s=time.monotonic() - started, **expected)
+    report("preflight", **expected)
     if args.preflight_only:
         return
     if not expected["raw_rows"]:

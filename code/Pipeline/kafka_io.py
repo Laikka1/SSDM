@@ -105,11 +105,12 @@ def enqueue(producer, delivery, **message):
         except BufferError:
             producer.poll(0.05)
 
-def replay_source(broker, topics):
+
+def replay_source(broker, topics, *, bounded=False, request_timeout_ms=None):
     from pyflink.common.serialization import SimpleStringSchema
     from pyflink.datastream.connectors.kafka import KafkaOffsetsInitializer, KafkaSource
 
-    return (
+    builder = (
         KafkaSource.builder()
         .set_bootstrap_servers(broker)
         .set_topics(topics.input)
@@ -118,14 +119,20 @@ def replay_source(broker, topics):
         .set_property("partition.discovery.interval.ms", "-1")
         .set_property("allow.auto.create.topics", "false")
         .set_value_only_deserializer(SimpleStringSchema())
-        .build()
     )
+    if bounded:
+        builder.set_bounded(KafkaOffsetsInitializer.latest())
+    if request_timeout_ms is not None:
+        builder.set_property("request.timeout.ms", str(request_timeout_ms))
+        builder.set_property("default.api.timeout.ms", str(max(60_000, request_timeout_ms + 5000)))
+    return builder.build()
 
-def result_sink(broker, topic):
+
+def result_sink(broker, topic, *, transactional=False, request_timeout_ms=None):
     from pyflink.common.serialization import SimpleStringSchema
     from pyflink.datastream.connectors.kafka import KafkaRecordSerializationSchema, KafkaSink
 
-    return (
+    builder = (
         KafkaSink.builder()
         .set_bootstrap_servers(broker)
         .set_record_serializer(
@@ -138,11 +145,20 @@ def result_sink(broker, topic):
         .set_property("delivery.timeout.ms", "15000")
         .set_property("request.timeout.ms", "10000")
         .set_property("linger.ms", "10")
-        .build()
     )
+    if transactional:
+        from pyflink.datastream.connectors.base import DeliveryGuarantee
+
+        builder.set_delivery_guarantee(DeliveryGuarantee.EXACTLY_ONCE)
+        builder.set_transactional_id_prefix(f"{topic}-")
+        builder.set_property("transaction.timeout.ms", "900000")
+    if request_timeout_ms is not None:
+        builder.set_property("request.timeout.ms", str(request_timeout_ms))
+        builder.set_property("delivery.timeout.ms", str(max(15_000, request_timeout_ms + 5000)))
+    return builder.build()
 
 
-def result_consumer(broker, group):
+def result_consumer(broker, group, *, partition_eof=False):
     from confluent_kafka import Consumer
 
     return Consumer({
@@ -150,14 +166,16 @@ def result_consumer(broker, group):
         "group.id": group,
         "enable.auto.commit": False,
         "allow.auto.create.topics": False,
+        "isolation.level": "read_committed",
+        "enable.partition.eof": partition_eof,
     })
 
 
 def read_outputs(broker, topics):
     """Read the records already present in the three output topics."""
-    from confluent_kafka import KafkaException, TopicPartition
+    from confluent_kafka import KafkaError, KafkaException, TopicPartition
 
-    consumer = result_consumer(broker, "trading-reference")
+    consumer = result_consumer(broker, "trading-reference", partition_eof=True)
     try:
         ends = {}
         starts = []
@@ -170,24 +188,26 @@ def read_outputs(broker, topics):
 
         consumer.assign(starts)
         deadline = time.monotonic() + 10
-        while ends:
+        while ends and time.monotonic() < deadline:
             message = consumer.poll(1)
             if message is None:
-                if time.monotonic() >= deadline:
-                    raise RuntimeError(f"timed out reading Kafka results from {sorted(ends)}")
                 continue
-            if message.error():
-                raise KafkaException(message.error())
             name = message.topic()
             end = ends.get(name)
+            error = message.error()
+            if error and error.code() != KafkaError._PARTITION_EOF:
+                raise KafkaException(error)
             if end is None:
                 continue
-            if message.offset() + 1 >= end:
+            next_offset = message.offset() if error else message.offset() + 1
+            if next_offset >= end:
                 consumer.pause([TopicPartition(name, 0)])
                 del ends[name]
-            if message.offset() < end:
+            if not error and message.offset() < end:
                 deadline = time.monotonic() + 10
                 yield {"topic": name, "record": json.loads(message.value())}
+        if ends:
+            raise RuntimeError(f"timed out reading Kafka results from {sorted(ends)}")
     finally:
         consumer.close()
 
