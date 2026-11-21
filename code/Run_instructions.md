@@ -44,6 +44,36 @@ when the command prints `Replay prefix`.
 )
 ```
 
+### Optional · Open the live visualization
+
+After Kafka is ready and the replay prefix is saved, run the viewer in a spare
+terminal. Use this same step for any replay below.
+
+```bash
+cd /home/jerry/SSDM
+source .venv311/bin/activate
+source code/logs/current-run.env
+python code/visualization/viewer_server.py --run-dir "code/logs/$PREFIX"
+```
+
+Open [the local viewer](http://127.0.0.1:8765/) in your browser. Start the worker
+in Terminal 2, wait for `READY`, then start the producer in Terminal 3. The
+viewer shows **Waiting for results** until the first five-minute window is
+finalized. Use the **Symbol** menu to switch between published symbols. Click
+an EMA point to see both EMA values and the close for that window. Click a BUY
+or SELL marker to see the EMA values before and after the crossover.
+The x-axis shows finalized windows at equal spacing, skipping empty intervals.
+A dashed vertical line marks each market date change.
+
+The viewer checks for updates once a second. For each new replay, stop the
+previous viewer with Ctrl+C and rerun the command above so it picks up the new
+prefix. For a saved run, pass its directory to `--run-dir`.
+If WSL reports `Address already in use`, stop the previous viewer or use
+`--port 8766` to keep both viewers open.
+If the browser shows a 404 while the viewer is running in WSL, a Windows
+service may be listening on the same port. Restart the viewer with
+`--port 8766` and open the URL it prints.
+
 ### Terminal 2 · Start the Flink consumer
 
 ```bash
@@ -334,47 +364,6 @@ stopping the job.
 
 ## Read the logs
 
-The worker creates `code/logs/$PREFIX/` on startup, writes progress and results,
-and prints `READY` when Flink is running and all eight partitions are visible.
-Flink serves its local UI on `http://127.0.0.1:8082`. The producer appends its
-own journal when it starts. Use one local worker at a time on that port.
-If metrics stay unavailable for `--timeout` seconds, the monitor logs
-`MONITOR_TIMEOUT` and retries while the Flink job continues.
-
-`worker.log` shows both `lag_records` (including progress markers) and
-`lag_seconds`. The latter estimates the age of the oldest unread record
-on the most delayed partition. The worker monitor interpolates between samples
-of Kafka's end offsets using a monotonic clock. It reports zero when all
-eight partitions have caught up and `unavailable` until it can bracket
-the unread offsets. The polling interval limits the estimate's precision.
-Flink REST can report old offsets after a WSL clock jump, temporarily
-inflating both lag measurements.
-
-`window_to_visible_seconds` in the EMA and advisory logs measures the time
-from the producer first reaching the end of a five-minute market window
-to the worker monitor receiving that result. It includes waiting for the
-watermark and delivery through Kafka. Wait for `READY` before replay so the monitor can match results against `producer.jsonl`.
-The two processes use the monotonic clock on the same Linux boot. A result
-without a matching live timing record shows `unavailable`. Use
-`window_watermark` to see which historical market time Flink has finalized.
-
-Each replay writes to `code/logs/$PREFIX/`.
-
-| File | What it shows |
-| --- | --- |
-| `ema.log` | Symbol, window end, close, EMA38, EMA100, and the source file and row |
-| `advisories.log` | BUY or SELL, window end, previous and current EMAs, and the crossover reason |
-| `worker.log` | Readiness, lag, offsets for input partitions 0–7, row classes, accepted prices by exchange, capture-date fallbacks, watermark, and result counts |
-| `producer.jsonl` | Input selection, replay rate, acknowledgements, CPU seconds, RSS in bytes, and window timing records |
-| `worker_resources.jsonl` | Timestamped CPU seconds and RSS in bytes for the worker and each live descendant, including the Flink JVM |
-| `flink/*.log` | Persistent Flink JVM logs |
-
-The diagnostics topic retains samples of housekeeping, quotes, late prices,
-and rejected rows.
-
-Paste this in a spare terminal to watch the result and worker logs.
-
-```bash
 cd /home/jerry/SSDM
 source code/logs/current-run.env
 tail -F "code/logs/$PREFIX/"{ema,advisories,worker}.log

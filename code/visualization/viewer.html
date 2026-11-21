@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trading trends</title>
+  <link rel="stylesheet" href="/viewer.css">
+  <script src="/viewer.js" defer></script>
+</head>
+<body>
+  <main>
+    <header class="page-header">
+      <div>
+        <h1>Trading trends</h1>
+        <p id="run-name"></p>
+      </div>
+      <div class="symbol-control">
+        <label for="symbol">Symbol</label>
+        <select id="symbol" disabled>
+          <option value="">Waiting for symbols</option>
+        </select>
+      </div>
+    </header>
+
+    <section class="panel" aria-labelledby="chart-title">
+      <header class="panel-header">
+        <div>
+          <h2 id="chart-title">Five-minute windows</h2>
+          <p id="status" role="status">Waiting for results</p>
+        </div>
+        <ul class="legend" aria-label="Chart legend">
+          <li><i class="line ema38"></i>EMA38</li>
+          <li><i class="line ema100"></i>EMA100</li>
+          <li><i class="triangle buy"></i>BUY</li>
+          <li><i class="triangle sell"></i>SELL</li>
+        </ul>
+      </header>
+      <div id="empty" class="empty">
+        <p>Finalized windows will appear here as the replay runs.</p>
+      </div>
+      <div id="chart" class="chart" hidden>
+        <canvas id="plot" role="img" aria-label="EMA38 and EMA100 by five-minute market window"></canvas>
+        <div id="markers" class="markers" role="group" aria-label="BUY and SELL advisories"></div>
+      </div>
+      <div id="market-time" class="market-time" hidden>
+        Finalized window ends · Market time (CET/CEST) · Empty intervals skipped
+        <p>Select an EMA point or BUY/SELL marker for details.</p>
+      </div>
+      <section id="details" class="details" aria-labelledby="details-title" hidden>
+        <div>
+          <h3 id="details-title"></h3>
+          <p id="details-time"></p>
+          <p id="details-reason"></p>
+        </div>
+        <table>
+          <thead><tr><th></th><th scope="col" data-previous>Previous</th><th scope="col">Current</th></tr></thead>
+          <tbody>
+            <tr id="details-ema38"><th scope="row">EMA38</th><td id="previous38" data-previous></td><td id="current38"></td></tr>
+            <tr id="details-ema100"><th scope="row">EMA100</th><td id="previous100" data-previous></td><td id="current100"></td></tr>
+            <tr><th scope="row">Close</th><td data-previous></td><td id="close"></td></tr>
+          </tbody>
+        </table>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

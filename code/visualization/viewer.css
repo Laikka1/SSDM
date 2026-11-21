@@ -1,0 +1,103 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, sans-serif;
+  background: #101624;
+  color: #eef3fb;
+  --panel: #171f30;
+  --border: #2f3a51;
+  --muted: #b1bed2;
+  --ema38: #45dcff;
+  --ema100: #ffb44d;
+  --buy: #61e6a4;
+  --sell: #ff8796;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+main { width: min(100% - 2rem, 72rem); margin: 3rem auto; }
+h1, h2, h3, p { margin: 0; }
+h1 { font-size: clamp(2rem, 5vw, 3rem); letter-spacing: -0.04em; }
+h2 { font-size: 1.18rem; }
+h3 { font-size: 1.05rem; }
+p { color: var(--muted); }
+
+.page-header, .panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.page-header { margin-bottom: 1.4rem; }
+#run-name { margin-top: 0.35rem; overflow-wrap: anywhere; }
+.symbol-control { display: grid; gap: 0.35rem; min-width: 11rem; }
+.symbol-control label { font-size: 0.9rem; color: var(--muted); }
+
+select {
+  appearance: none;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  padding: 0.65rem 2rem 0.65rem 0.75rem;
+  font: inherit;
+  color: inherit;
+  background-color: var(--panel);
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+                    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 50%, calc(100% - 10px) 50%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+
+select:disabled { color: var(--muted); }
+:focus-visible { outline: 2px solid var(--ema38); outline-offset: 3px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 0.8rem; overflow: hidden; }
+.panel-header { padding: 1.2rem 1.4rem; border-bottom: 1px solid var(--border); }
+#status { margin-top: 0.4rem; font-variant-numeric: tabular-nums; }
+.legend { display: flex; flex-wrap: wrap; gap: 0.65rem 1rem; margin: 0; padding: 0; list-style: none; }
+.legend li { display: flex; align-items: center; gap: 0.35rem; font-size: 0.9rem; }
+.line { width: 1.15rem; height: 3px; border-radius: 2px; }
+.ema38 { background: var(--ema38); }
+.ema100 { height: 0; border-top: 3px dashed var(--ema100); border-radius: 0; }
+.triangle { display: inline-block; width: 0.8rem; height: 0.72rem; }
+.buy .triangle, .triangle.buy { background: var(--buy); clip-path: polygon(50% 0, 100% 100%, 0 100%); }
+.sell .triangle, .triangle.sell { background: var(--sell); clip-path: polygon(0 0, 100% 0, 50% 100%); }
+.empty { display: grid; place-items: center; min-height: 19rem; padding: 1rem; text-align: center; }
+.chart { position: relative; height: clamp(19rem, 52vh, 35rem); margin: 1rem 0.6rem 0; }
+canvas, .markers { position: absolute; inset: 0; width: 100%; height: 100%; }
+canvas.point-hover { cursor: pointer; }
+.markers { pointer-events: none; }
+
+.marker {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  width: 1.65rem;
+  height: 1.65rem;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: #171f30d9;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.marker:hover, .marker[aria-pressed="true"] { border-color: var(--muted); }
+.marker:focus-visible, .marker[aria-pressed="true"] { z-index: 1; }
+.market-time { text-align: center; padding: 0.2rem 0.6rem 1rem; color: var(--muted); font-size: 0.9rem; }
+.market-time p { margin-top: 0.3rem; }
+.details { display: flex; flex-wrap: wrap; gap: 1rem 2rem; padding: 1rem 1.4rem; border-top: 1px solid var(--border); }
+.details p { margin-top: 0.35rem; }
+.details table { border-collapse: collapse; text-align: right; font-variant-numeric: tabular-nums; }
+.details th, .details td { padding: 0.25rem 0.55rem; }
+.details th { font-weight: 500; color: var(--muted); }
+#details-ema38.selected th, #details-ema38.selected td { color: var(--ema38); }
+#details-ema100.selected th, #details-ema100.selected td { color: var(--ema100); }
+
+@media (max-width: 35rem) {
+  main { width: calc(100% - 1rem); margin: 1.4rem auto; }
+  .panel-header, .details { padding-inline: 0.8rem; }
+}
