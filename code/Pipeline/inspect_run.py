@@ -1,31 +1,48 @@
-#!/usr/bin/env python3
-"""Follow a replay's Kafka results and Flink metrics from outside the worker."""
+"""Write Kafka results and Flink progress to the local run directory."""
 
-import argparse
+from bisect import bisect_left
 from collections import Counter, deque
-from contextlib import ExitStack
 from datetime import datetime, timezone
 import fcntl
 import json
-import math
 from pathlib import Path
 import re
 import time
-from urllib.error import HTTPError, URLError
+from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+import psutil
 from confluent_kafka import KafkaException, OFFSET_BEGINNING, TopicPartition
 from confluent_kafka.admin import AdminClient, OffsetSpec
 
-from kafka_io import INPUT_PARTITIONS, Topics, result_consumer
-from normalization import TERMINAL_CLASSES
+from kafka_io import BROKER, INPUT_PARTITIONS, result_consumer
+from normalization import MARKET_ZONES, TERMINAL_CLASSES
 
-LOG_ROOT = Path(__file__).resolve().parents[1] / "logs"
-FAILED_STATES = {"CANCELED", "CANCELLING", "FAILED", "FAILING", "FINISHED", "RESTARTING", "SUSPENDED"}
-OUTPUT_COUNTERS = {"EMA": "ema_published", "BUY": "buy_published", "SELL": "sell_published"}
+REST_PORT = 8082
+EXCHANGE_COUNTS = tuple(f"price_accepted_{exchange}" for exchange in MARKET_ZONES)
+PROGRESS_COUNTS = (*TERMINAL_CLASSES, *EXCHANGE_COUNTS, "missing_trading_date_fallbacks")
+LOGGED_COUNTERS = {*PROGRESS_COUNTS, "raw_received", "price_windows_completed"}
+FAILED_STATES = {"CANCELED", "CANCELLING", "FAILED", "SUSPENDED"}
 UNAVAILABLE = "unavailable"
 METRIC_REQUEST_LIMIT = 3000
+
+
+def replay_clock_id():
+    # Monotonic timestamps can be compared across processes on the same Linux boot.
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return None
+
+
+def process_usage(process):
+    with process.oneshot():
+        cpu = process.cpu_times()
+        return {
+            "pid": process.pid, "name": process.name(), "created": process.create_time(),
+            "cpu_seconds": cpu.user + cpu.system, "rss_bytes": process.memory_info().rss,
+        }
 
 
 def timestamp():
@@ -40,28 +57,154 @@ def fields(data):
     return "  ".join(f"{name}={clean(value)}" for name, value in data.items())
 
 
+class BacklogAge:
+    """Estimate the age of the oldest unread record from sampled partition end offsets."""
+
+    def __init__(self, partitions):
+        self.history = [deque() for _ in range(partitions)]
+
+    def sample(self, offsets, ends, now):
+        ages = []
+        for partition, history in enumerate(self.history):
+            end = ends.get(partition)
+            if end is None:
+                continue
+            if history and end < history[-1][1]:
+                history.clear()
+            # Keep the first and last observation of a plateau to bracket bursts.
+            if len(history) >= 2 and history[-2][1] == history[-1][1] == end:
+                history.pop()
+            history.append((now, end))
+            offset = offsets.get(partition)
+            if offset is None or offset < 0 or offset > end:
+                continue
+            while len(history) > 1 and history[1][1] <= offset:
+                history.popleft()
+            if offset == end:
+                ages.append(0.0)
+            elif len(history) >= 2 and history[0][1] <= offset:
+                (before, low), (after, high) = history[0], history[1]
+                arrival = before + (after - before) * (offset - low) / (high - low)
+                ages.append(now - arrival)
+        return max(ages) if len(ages) == len(self.history) else None
+
+
+class WindowTimings:
+    """Match a live result to the producer's first crossing of its window boundary."""
+
+    def __init__(self, stack, path):
+        self.stack = stack
+        self.path = path
+        self.file = None
+        self.boot = replay_clock_id()
+        self.started_ns = time.monotonic_ns()
+        self.ends = []
+        self.times = []
+
+    def read_new_frontiers(self):
+        if self.file is None:
+            try:
+                self.file = self.stack.enter_context(self.path.open(encoding="utf-8"))
+            except FileNotFoundError:
+                return
+        while True:
+            position = self.file.tell()
+            line = self.file.readline()
+            if not line.endswith("\n"):
+                self.file.seek(position)
+                break
+            if '"window_frontier"' not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict) or row.get("event") != "window_frontier" or row.get("clock_id") != self.boot:
+                continue
+            end, stamp = row.get("window_end_ms"), row.get("monotonic_ns")
+            if type(end) is int and type(stamp) is int and (not self.ends or self.ends[-1] < end):
+                self.ends.append(end)
+                self.times.append(stamp)
+
+    def seconds(self, window_end_ms, received_ns):
+        if self.boot is None or window_end_ms is None:
+            return None
+        self.read_new_frontiers()
+        # A trade can cross several boundaries. Use the first frontier at or beyond this window.
+        index = bisect_left(self.ends, window_end_ms)
+        if index < len(self.times) and self.started_ns <= self.times[index] <= received_ns:
+            return (received_ns - self.times[index]) / 1e9
+        return None
+
+
+def recover_last_offset(file):
+    """Recover the last logged Kafka offset and discard an interrupted final write."""
+    file.seek(0)
+    last_offset = -1
+    while True:
+        line_start = file.tell()
+        line = file.readline()
+        if not line:
+            return last_offset
+        if not line.endswith("\n"):
+            file.truncate(line_start)
+            return last_offset
+        parts = line.split(maxsplit=2)
+        if len(parts) == 3 and parts[1].startswith("offset="):
+            offset = parts[1].removeprefix("offset=")
+            if offset.isascii() and offset.isdecimal():
+                last_offset = int(offset)
+
+
 class ResultLogs:
-    def __init__(self, stack, directory, topics):
+    def __init__(self, stack, topics):
+        directory = topics.log_dir
+        directory.mkdir(parents=True, exist_ok=True)
+        self.worker = stack.enter_context((directory / "worker.log").open("a", buffering=1, encoding="utf-8"))
+        try:
+            fcntl.flock(self.worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"A worker already owns {directory}.") from None
+        self.process = psutil.Process()
+        self.resources = stack.enter_context(
+            (directory / "worker_resources.jsonl").open("a", buffering=1, encoding="utf-8")
+        )
         self.topics = topics
         self.files = {}
         self.last_offset = {}
         self.counts = Counter()
+        self.timings = WindowTimings(stack, directory / "producer.jsonl")
         for topic, filename in ((topics.windows, "ema.log"), (topics.advisories, "advisories.log")):
-            file = stack.enter_context((directory / filename).open("a+", buffering=1, encoding="utf-8"))
-            file.seek(0)
-            last = deque(file, maxlen=1)
-            self.last_offset[topic] = int(last[0].split()[1].split("=", 1)[1]) if last else -1
+            file = stack.enter_context(
+                (directory / filename).open("a+", buffering=1, encoding="utf-8", errors="surrogateescape")
+            )
+            self.last_offset[topic] = recover_last_offset(file)
             self.files[topic] = file
+
+    def log(self, event, **data):
+        line = f"{timestamp()} {event}  {fields(data)}"
+        print(line, file=self.worker)
+        print(line, flush=True)
+
+    def sample_resources(self):
+        processes = []
+        for process in [self.process, *self.process.children(recursive=True)]:
+            try:
+                processes.append(process_usage(process))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        print(json.dumps({"time": timestamp(), "monotonic_ns": time.monotonic_ns(), "processes": processes}),
+              file=self.resources)
 
     def record(self, message):
         topic = message.topic()
-        if topic == self.topics.diagnostics:
-            self.counts["diagnostics"] += 1
-            return
-
         row = json.loads(message.value())
         result = "EMA" if topic == self.topics.windows else row["advice"]
+        # Rebuild the observed totals when Kafka replays records already on disk.
         self.counts[result] += 1
+        offset = message.offset()
+        if offset <= self.last_offset[topic]:
+            return
         details = {
             "type": result, "symbol": row["symbol"], "window_end": row["window_end"],
             "close": row["close"], "EMA38": row["ema38"], "EMA100": row["ema100"],
@@ -71,75 +214,22 @@ class ResultLogs:
         else:
             details.update(previous_EMA38=row["previous_ema38"], previous_EMA100=row["previous_ema100"],
                            reason=row["reason"])
-        offset = message.offset()
-        if offset > self.last_offset[topic]:
-            print(f"{timestamp()} offset={offset}  {fields(details)}", file=self.files[topic])
-            self.last_offset[topic] = offset
-
-
-class ProducerJournal:
-    def __init__(self, path):
-        self.path = path
-        self.position = 0
-        self.latest = None
-        self.terminal = None
-        self.finished = None
-        self.failed = None
-
-    def poll(self):
-        if not self.path.is_file():
-            return
-        with self.path.open(encoding="utf-8") as file:
-            file.seek(self.position)
-            while line := file.readline():
-                if not line.endswith("\n"):
-                    break
-                self.position = file.tell()
-                entry = json.loads(line)
-                event = entry["event"]
-                if event in {"replay_started", "delivery_totals", "replay_finished"}:
-                    self.latest = entry
-                if event == "progress_acked" and entry.get("terminal"):
-                    self.terminal = entry
-                if event == "replay_finished" and self.finished is None:
-                    self.finished = time.monotonic()
-                if event == "replay_failed":
-                    self.failed = entry.get("last_error") or "producer interrupted or exited with an error"
-
-
-class FlinkJobGone(RuntimeError):
-    pass
+        delay = self.timings.seconds(row.get("window_end_ms"), time.monotonic_ns())
+        details["window_to_visible_seconds"] = round(delay, 3) if delay is not None else UNAVAILABLE
+        print(f"{timestamp()} offset={offset}  {fields(details)}", file=self.files[topic])
+        self.last_offset[topic] = offset
 
 
 class Flink:
-    def __init__(self, base_url, topic):
-        self.base_url = base_url.rstrip("/")
-        self.topic = topic
-        self.job_id = None
+    def __init__(self, job_id, topic):
+        self.base_url = f"http://127.0.0.1:{REST_PORT}"
+        self.job_id = job_id
         self.partition_metric = re.compile(rf"\.KafkaSourceReader\.topic\.{re.escape(topic)}\.partition\.(\d+)\.currentOffset$")
 
     def get(self, path, **params):
         query = "?" + urlencode(params) if params else ""
         with urlopen(self.base_url + path + query, timeout=2) as response:
             return json.load(response)
-
-    def job(self):
-        if self.job_id is None:
-            jobs = self.get("/jobs/overview")["jobs"]
-            matches = [job for job in jobs if job["name"] == f"trading-replay:{self.topic}"]
-            if not matches:
-                return None
-            self.job_id = max(matches, key=lambda job: job["start-time"])["jid"]
-        try:
-            return self.get(f"/jobs/{self.job_id}")
-        except HTTPError as exc:
-            if exc.code == 404:
-                raise FlinkJobGone(f"Flink REST no longer reports job {self.job_id}") from exc
-            raise
-
-    def subscriptions(self):
-        config = self.get(f"/jobs/{self.job_id}/config")["execution-config"]
-        return config.get("user-config", {}).get("trading.subscriptions", UNAVAILABLE)
 
     def failure(self):
         data = self.get(f"/jobs/{self.job_id}/exceptions")
@@ -181,7 +271,8 @@ class Flink:
             ids = [item["id"] for item in self.get(path)]
             wanted = [
                 key for key in ids
-                if ".trading." in key or self.partition_metric.search(key)
+                if (".trading." in key and key.rsplit(".", 1)[1] in LOGGED_COUNTERS)
+                or self.partition_metric.search(key)
                 or (is_window and key.endswith(".currentOutputWatermark"))
             ]
             for metric in self.metric_samples(path, wanted):
@@ -204,28 +295,22 @@ class Flink:
         return offsets, counts, watermark
 
 
-def progress_fields(offsets, ends, counts, watermark, journal, observed):
-    acked = journal.latest["raw_acked"] if journal.latest else None
-    raw_read = counts.get("raw_received")
-
+def progress_fields(offsets, ends, counts, watermark, observed, lag_seconds):
     lag = {p: ends[p] - offset for p, offset in offsets.items() if p in ends}
     lag_available = len(lag) == INPUT_PARTITIONS and min(lag.values()) >= 0
     total = sum(lag.values()) if lag_available else None
     busiest = min(lag, key=lambda p: (-lag[p], p)) if total else None
-    producer_state = "finished" if journal.finished is not None else "replaying" if journal.latest else "waiting"
-    raw_backlog = acked - raw_read if acked is not None and raw_read is not None else None
-    sample = {
-        "producer_state": producer_state,
+    return {
         "partitions": f"{len(offsets)}/{INPUT_PARTITIONS}",
+        "partition_offsets": ",".join(str(offsets.get(p, UNAVAILABLE)) for p in range(INPUT_PARTITIONS)),
         "lag_records": total if total is not None else UNAVAILABLE,
+        "lag_seconds": round(lag_seconds, 3) if total is not None and lag_seconds is not None else UNAVAILABLE,
         "busiest_partition": (
             f"{busiest} ({lag[busiest]} records)" if busiest is not None
             else "none" if total == 0 else UNAVAILABLE
         ),
-        "raw_acked": acked if acked is not None else UNAVAILABLE,
-        "raw_read": raw_read if raw_read is not None else UNAVAILABLE,
-        "raw_backlog": raw_backlog if raw_backlog is not None and raw_backlog >= 0 else UNAVAILABLE,
-        **{kind: counts.get(kind, UNAVAILABLE) for kind in TERMINAL_CLASSES},
+        "raw_read": counts.get("raw_received", UNAVAILABLE),
+        **{kind: counts.get(kind, UNAVAILABLE) for kind in PROGRESS_COUNTS},
         "price_windows": counts.get("price_windows_completed", UNAVAILABLE),
         "ema": observed["EMA"], "buy": observed["BUY"], "sell": observed["SELL"],
         "window_watermark": (
@@ -233,53 +318,53 @@ def progress_fields(offsets, ends, counts, watermark, journal, observed):
             if watermark is not None and watermark > -(2 ** 63) else UNAVAILABLE
         ),
     }
-    return total, sample
 
 
-def terminal_partitions_read(journal, offsets):
-    if journal.terminal is None:
-        return 0
-    return sum(offsets.get(int(partition), 0) > offset
-               for partition, offset in journal.terminal["offsets"].items())
+class ProgressSampler:
+    def __init__(self, topic):
+        self.admin_config = {"bootstrap.servers": BROKER}
+        self.admin = AdminClient(self.admin_config)
+        self.backlog = BacklogAge(INPUT_PARTITIONS)
+        self.requested = {
+            TopicPartition(topic, partition): OffsetSpec.latest()
+            for partition in range(INPUT_PARTITIONS)
+        }
+
+    def sample(self, flink, job, results):
+        offsets, counts, watermark = flink.metrics(job)
+        try:
+            ends = {
+                tp.partition: result.result(timeout=3).offset
+                for tp, result in self.admin.list_offsets(self.requested, request_timeout=2).items()
+            }
+        except (KafkaException, TimeoutError) as exc:
+            # A new client discovers current leaders after a broker epoch change.
+            self.admin = AdminClient(self.admin_config)
+            ends = {}
+            results.log("KAFKA_OFFSETS_UNAVAILABLE", error=exc)
+        lag_seconds = self.backlog.sample(offsets, ends, time.monotonic())
+        sample = progress_fields(offsets, ends, counts, watermark, results.counts, lag_seconds)
+        complete = len(offsets) == len(ends) == INPUT_PARTITIONS
+        return sample, complete
 
 
-def drained(journal, lag, terminal_reads, counters, watermark, observed):
-    if journal.finished is None or terminal_reads != INPUT_PARTITIONS or lag not in (None, 0):
-        return False
-    final = journal.latest
-    return (
-        watermark is not None
-        and watermark >= journal.terminal["eligible_watermark_ms"]
-        and counters.get("terminal_markers") == INPUT_PARTITIONS
-        and counters.get("progress_markers") == final["markers_acked"]
-        and counters.get("raw_received") == final["raw_acked"]
-        and sum(counters.get(kind, 0) for kind in TERMINAL_CLASSES) == final["raw_acked"]
-        and (not counters.get("price_accepted") or "price_windows_completed" in counters)
-        and all(counters.get(metric, 0) == observed[name] for name, metric in OUTPUT_COUNTERS.items())
-        and sum(n for key, n in counters.items() if key.startswith("diagnostics_sampled_")) == observed["diagnostics"]
-    )
-
-
-def monitor(args, topics, results, worker_log):
-    def log(event, **data):
-        line = f"{timestamp()} {event}  {fields(data)}"
-        print(line, flush=True)
-        print(line, file=worker_log)
-
-    flink = Flink(args.rest_url, topics.input)
-    journal = ProducerJournal(args.directory / "producer.jsonl")
-    consumer = result_consumer(args.broker, "trading-inspector")
-    admin_config = {"bootstrap.servers": args.broker}
-    admin = AdminClient(admin_config)
-    requested = {TopicPartition(topics.input, p): OffsetSpec.latest() for p in range(INPUT_PARTITIONS)}
+def monitor(args, client, results):
+    topics = args.topics
+    log = results.log
+    flink = Flink(str(client.get_job_id()), topics.input)
+    completion = client.get_job_execution_result()
+    progress = ProgressSampler(topics.input)
+    consumer = result_consumer()
     started = time.monotonic()
-    last_job_seen = started
+    last_complete_sample = started
+    timeout_reported = False
     next_sample = started
-    announced = ready = False
-    log("WAITING", prefix=topics.input, flink_rest=args.rest_url, broker=args.broker)
+    ready = False
+    log("WAITING", prefix=topics.input, flink_rest=flink.base_url, broker=BROKER,
+        monitor_start_ns=round(started * 1e9))
 
     try:
-        consumer.assign([TopicPartition(topic, 0, OFFSET_BEGINNING) for topic in topics.outputs()])
+        consumer.assign([TopicPartition(topic, 0, OFFSET_BEGINNING) for topic in (topics.windows, topics.advisories)])
         while True:
             message = consumer.poll(0.1)
             if message is not None:
@@ -290,99 +375,34 @@ def monitor(args, topics, results, worker_log):
             if time.monotonic() < next_sample:
                 continue
             next_sample = time.monotonic() + args.interval
-            journal.poll()
-            if journal.failed:
-                log("FAILED", producer_error=journal.failed)
-                return 1
-
+            if completion.done():
+                completion.result()  # Surface task failures even after the local REST server exits.
+                break
+            results.sample_resources()
             try:
-                job = flink.job()
-                if job is not None:
-                    last_job_seen = time.monotonic()
-                if job is None:
-                    log("WAITING", reason="Flink job has not registered for this prefix")
-                elif job["state"] in FAILED_STATES:
-                    log("FAILED", job_id=flink.job_id, state=job["state"], error=flink.failure())
+                job = flink.get(f"/jobs/{flink.job_id}")
+                state = job["state"]
+                if state == "FINISHED":
+                    break
+                if state in FAILED_STATES:
+                    log("FAILED", job_id=flink.job_id, state=state, error=flink.failure())
                     return 1
-                else:
-                    if not announced:
-                        log("STARTED", job_id=flink.job_id, state=job["state"],
-                            parallelism=job["vertices"][0]["parallelism"], subscriptions=flink.subscriptions())
-                        announced = True
-                    offsets, counts, watermark = flink.metrics(job)
-                    try:
-                        ends = {
-                            tp.partition: result.result(timeout=3).offset
-                            for tp, result in admin.list_offsets(requested, request_timeout=2).items()
-                        }
-                    except (KafkaException, TimeoutError) as exc:
-                        # A new client discovers current leaders after a broker epoch change.
-                        admin = AdminClient(admin_config)
-                        ends = {}
-                        log("KAFKA_OFFSETS_UNAVAILABLE", error=exc)
-                    if not ready and job["state"] == "RUNNING" and len(offsets) == len(ends) == INPUT_PARTITIONS:
+                sample, complete = progress.sample(flink, job, results)
+                if state == "RUNNING" and complete:
+                    last_complete_sample = time.monotonic()
+                    timeout_reported = False
+                    if not ready:
                         log("READY", job_id=flink.job_id, prefix=topics.input, partitions=INPUT_PARTITIONS)
                         ready = True
-                    lag, sample = progress_fields(
-                        offsets, ends, counts, watermark, journal, results.counts,
-                    )
-                    terminal_reads = terminal_partitions_read(journal, offsets)
-                    sample["terminal_partitions_read"] = f"{terminal_reads}/{INPUT_PARTITIONS}"
-                    if drained(journal, lag, terminal_reads, counts, watermark, results.counts):
-                        log("DRAINED", **sample)
-                        return 0
-                    log("PROGRESS", state=job["state"], **sample)
-            except FlinkJobGone as exc:
-                log("FAILED", job_id=flink.job_id, error=exc, details="Check the Flink logs for this replay.")
-                return 1
+                log("PROGRESS", state=state, **sample, elapsed_seconds=round(time.monotonic() - started, 3))
             except (URLError, TimeoutError, KafkaException) as exc:
-                log("UNAVAILABLE", lag_records=UNAVAILABLE, error=exc)
+                log("UNAVAILABLE", lag_records=UNAVAILABLE, lag_seconds=UNAVAILABLE, error=exc)
 
-            now = time.monotonic()
-            if not ready and now - started >= args.timeout:
-                log("FAILED", reason="worker did not become ready", details="Check the worker terminal and topic prefix.")
-                return 1
-            if ready and now - last_job_seen >= args.timeout:
-                log("FAILED", job_id=flink.job_id, reason="worker stopped responding",
-                    details="Check the Flink logs for this replay.")
-                return 1
-            if journal.finished is not None and now - journal.finished >= args.timeout:
-                log("FAILED", reason="replay did not drain", details="Check the last progress line and worker terminal.")
-                return 1
+            if not timeout_reported and time.monotonic() - last_complete_sample >= args.timeout:
+                reason = "progress metrics unavailable" if ready else "waiting for all input partitions"
+                log("MONITOR_TIMEOUT", job_id=flink.job_id, reason=reason, retrying=True)
+                timeout_reported = True
+        log("FINISHED", job_id=flink.job_id)
+        return 0
     finally:
         consumer.close()
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--topic-prefix", required=True)
-    parser.add_argument("--broker", default="localhost:9092")
-    parser.add_argument("--rest-url", default="http://127.0.0.1:8082")
-    parser.add_argument("--log-root", type=Path, default=LOG_ROOT)
-    parser.add_argument("--interval", type=float, default=2, help="Seconds between progress reports")
-    parser.add_argument("--timeout", type=float, default=90,
-                        help="Seconds to wait for readiness, worker response, or final drain")
-    args = parser.parse_args()
-    try:
-        topics = Topics.from_prefix(args.topic_prefix)
-        if any(not math.isfinite(value) or value <= 0 for value in (args.interval, args.timeout)):
-            raise ValueError("--interval and --timeout must be positive and finite")
-    except ValueError as exc:
-        parser.error(str(exc))
-    args.directory = args.log_root / topics.input
-    args.directory.mkdir(parents=True, exist_ok=True)
-    with ExitStack() as stack:
-        worker_log = stack.enter_context((args.directory / "worker.log").open("a", buffering=1, encoding="utf-8"))
-        try:
-            fcntl.flock(worker_log, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit(f"An inspector is already writing {worker_log.name}.") from None
-        results = ResultLogs(stack, args.directory, topics)
-        try:
-            return monitor(args, topics, results, worker_log)
-        except KeyboardInterrupt:
-            return 130
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

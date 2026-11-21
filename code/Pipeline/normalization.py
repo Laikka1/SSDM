@@ -3,7 +3,6 @@
 from datetime import datetime, time
 from functools import lru_cache
 from math import isfinite
-from pathlib import Path
 import re
 from zoneinfo import ZoneInfo
 
@@ -19,11 +18,6 @@ QUOTE = "quote_only"
 HOUSEKEEPING = "housekeeping_or_metadata"
 REJECTED = "rejected"
 TERMINAL_CLASSES = ("price_accepted", "price_late", QUOTE, HOUSEKEEPING, REJECTED)
-REJECT_REASONS = (
-    "invalid_envelope", "malformed_json", "invalid_csv_row", "missing_symbol",
-    "invalid_symbol", "invalid_security_type", "invalid_numeric_value",
-    "invalid_price_value", "invalid_trade_time", "ambiguous_trading_date",
-)
 CLOCK_RE = re.compile(r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?")
 MARKET_ZONES = {exchange: ZoneInfo(zone) for exchange, zone in EXCHANGE_TIMEZONES.items()}
 
@@ -39,26 +33,10 @@ def normalize_symbol(value: str) -> str:
     return symbol
 
 
-def load_subscriptions(
-    symbols: str | None = None, file_path: str | None = None
-) -> set[str] | None:
-    """Return configured symbols, or None when output should remain unfiltered."""
-    if symbols is None and file_path is None:
+def parse_subscriptions(symbols: str | None) -> set[str] | None:
+    if symbols is None:
         return None
-
-    values: list[str] = []
-    if symbols is not None:
-        values.extend(symbols.split(","))
-    if file_path is not None:
-        try:
-            values.extend(
-                line.split("#", 1)[0].strip()
-                for line in Path(file_path).read_text(encoding="utf-8").splitlines()
-            )
-        except OSError as exc:
-            raise ValueError(f"could not read subscriptions file {file_path!r}: {exc}") from exc
-
-    return {normalize_symbol(value) for value in values if value.strip()}
+    return {normalize_symbol(value) for value in symbols.split(",") if value.strip()}
 
 
 @lru_cache(maxsize=64)
@@ -121,7 +99,7 @@ def project_row(row, source_file, source_index, source_row):
             trade_us, trade_clock = _trade_clock(
                 trading_date, trading_time, capture_date, capture_time, exchange
             )
-    return {
+    record = {
         "kind": "row",
         "symbol": symbol,
         "exchange": exchange if exchange in MARKET_ZONES else "",
@@ -138,11 +116,13 @@ def project_row(row, source_file, source_index, source_row):
         "source_file": source_file,
         "source_index": source_index,
         "source_row": source_row,
-        **({"csv_error": True} if any(row.get(None, ())) or None in row.values() else {}),
     }
+    if any(row.get(None, ())) or None in row.values():
+        record["csv_error"] = True
+    return record
 
 
-def _positive_price(value):
+def _parse_price(value):
     if not isinstance(value, str):
         raise ValueError("invalid_envelope")
     if not value:
@@ -181,9 +161,9 @@ def classify_row(record):
     if not isinstance(sec_type, str) or sec_type not in SUPPORTED_SECURITY_TYPES:
         return REJECTED, 0.0, "invalid_security_type"
     try:
-        last = _positive_price(record.get("last"))
-        ask = _positive_price(record.get("ask"))
-        bid = _positive_price(record.get("bid"))
+        last = _parse_price(record.get("last"))
+        ask = _parse_price(record.get("ask"))
+        bid = _parse_price(record.get("bid"))
     except ValueError as exc:
         return REJECTED, 0.0, str(exc)
     if last:

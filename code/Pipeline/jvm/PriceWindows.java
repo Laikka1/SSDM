@@ -41,7 +41,7 @@ public final class PriceWindows extends KeyedProcessFunction<String, Row, String
     private transient MapState<Long, Tuple5<Long, Integer, Long, Double, String>> windows;
     private transient ValueState<Tuple2<Double, Double>> previousEmas;
     private transient ObjectMapper json;
-    private transient Counter accepted, late, completed, ema, buy, sell, sampled, suppressed;
+    private transient Counter accepted, late, completed;
     private transient Map<String, Counter> acceptedByExchange;
     private transient int lateSamples;
 
@@ -70,11 +70,6 @@ public final class PriceWindows extends KeyedProcessFunction<String, Row, String
         accepted = metrics.counter("price_accepted");
         late = metrics.counter("price_late");
         completed = metrics.counter("price_windows_completed");
-        ema = metrics.counter("ema_published");
-        buy = metrics.counter("buy_published");
-        sell = metrics.counter("sell_published");
-        sampled = metrics.counter("diagnostics_sampled_price_late");
-        suppressed = metrics.counter("diagnostics_suppressed_price_late");
         acceptedByExchange = new HashMap<>();
         for (String exchange : ZONES.keySet()) {
             acceptedByExchange.put(exchange, metrics.counter("price_accepted_" + exchange));
@@ -89,11 +84,9 @@ public final class PriceWindows extends KeyedProcessFunction<String, Row, String
         if (watermark >= end) {
             late.inc();
             if (lateSamples >= diagnosticCap) {
-                suppressed.inc();
                 return;
             }
             lateSamples++;
-            sampled.inc();
             context.output(DIAGNOSTICS, json.createObjectNode()
                     .put("kind", "price_late").put("reason", "window_already_final")
                     .put("symbol", context.getCurrentKey()).put("trade_us", tradeUs)
@@ -105,36 +98,42 @@ public final class PriceWindows extends KeyedProcessFunction<String, Row, String
 
         accepted.inc();
         acceptedByExchange.get(exchange(context.getCurrentKey())).inc();
-        Tuple5<Long, Integer, Long, Double, String> candidate = windows.get(end);
+        Tuple5<Long, Integer, Long, Double, String> currentClose = windows.get(end);
         int sourceIndex = row.getFieldAs(2);
         long sourceRow = row.getFieldAs(3);
-        if (candidate == null) {
+        if (currentClose == null) {
             context.timerService().registerEventTimeTimer(end);
         }
-        if (candidate == null || isLater(tradeUs, sourceIndex, sourceRow, candidate)) {
+        if (currentClose == null || isLater(tradeUs, sourceIndex, sourceRow, currentClose)) {
             windows.put(end, Tuple5.of(tradeUs, sourceIndex, sourceRow, row.getFieldAs(4), row.getFieldAs(5)));
         }
     }
 
     private static boolean isLater(
-            long tradeUs, int sourceIndex, long sourceRow, Tuple5<Long, Integer, Long, Double, String> close) {
-        int byTime = Long.compare(tradeUs, close.f0);
+            long tradeUs, int sourceIndex, long sourceRow,
+            Tuple5<Long, Integer, Long, Double, String> currentClose) {
+        long closeTradeUs = currentClose.f0;
+        int closeSourceIndex = currentClose.f1;
+        long closeSourceRow = currentClose.f2;
+        int byTime = Long.compare(tradeUs, closeTradeUs);
         if (byTime != 0) {
             return byTime > 0;
         }
-        int byFile = Integer.compare(sourceIndex, close.f1);
-        return byFile > 0 || (byFile == 0 && sourceRow > close.f2);
+        // At equal trade times, the later source file and row win.
+        int byFile = Integer.compare(sourceIndex, closeSourceIndex);
+        return byFile > 0 || (byFile == 0 && sourceRow > closeSourceRow);
     }
 
     @Override
     public void onTimer(long end, OnTimerContext context, Collector<String> output) throws Exception {
-        Tuple5<Long, Integer, Long, Double, String> close = windows.get(end);
+        Tuple5<Long, Integer, Long, Double, String> closingTrade = windows.get(end);
         windows.remove(end);
+        double close = closingTrade.f3;
         Tuple2<Double, Double> previous = previousEmas.value();
         double previous38 = previous == null ? 0 : previous.f0;
         double previous100 = previous == null ? 0 : previous.f1;
-        double fast = ema(close.f3, previous38, 38);
-        double slow = ema(close.f3, previous100, 100);
+        double fast = ema(close, previous38, 38);
+        double slow = ema(close, previous100, 100);
         previousEmas.update(Tuple2.of(fast, slow));
         completed.inc();
 
@@ -144,18 +143,19 @@ public final class PriceWindows extends KeyedProcessFunction<String, Row, String
         }
         ZoneId zone = ZONES.get(exchange(symbol));
         String id = runId + ":" + symbol + ":" + end;
+        long tradeUs = closingTrade.f0;
+        int sourceIndex = closingTrade.f1;
+        long sourceRow = closingTrade.f2;
+        String sourceFile = closingTrade.f4;
         ObjectNode result = json.createObjectNode().put("run_id", runId).put("symbol", symbol)
                 .put("window_start", windowTime(end - WINDOW_MS, zone)).put("window_end", windowTime(end, zone))
-                .put("window_end_ms", end).put("close", close.f3).put("ema38", fast).put("ema100", slow);
-        ema.inc();
+                .put("window_end_ms", end).put("close", close).put("ema38", fast).put("ema100", slow);
         output.collect(result.deepCopy().put("kind", "ema").put("result_id", id + ":ema")
-                .put("trade_us", close.f0).put("source_index", close.f1)
-                .put("source_row", close.f2).put("source_file", close.f4).toString());
+                .put("trade_us", tradeUs).put("source_index", sourceIndex)
+                .put("source_row", sourceRow).put("source_file", sourceFile).toString());
         if (previous38 <= previous100 && fast > slow) {
-            buy.inc();
             advice(context, result, id + ":buy", "BUY", "bullish_crossover", previous38, previous100);
         } else if (previous38 >= previous100 && fast < slow) {
-            sell.inc();
             advice(context, result, id + ":sell", "SELL", "bearish_crossover", previous38, previous100);
         }
     }
