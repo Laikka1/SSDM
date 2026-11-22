@@ -21,17 +21,15 @@ from pyflink.datastream.functions import KeyedProcessFunction, ProcessFunction
 from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
 from pyflink.java_gateway import get_gateway
 
-from calculations import (
-    DEFAULT_LATENESS_SECONDS, WINDOW_MS, calculate_ema, detect_crossover,
-    lateness_ms, window_end_ms, window_iso,
-)
 from inspect_run import REST_PORT, ResultLogs, monitor
 from kafka_io import BROKER, DEFAULT_PREFIX, INPUT_PARTITIONS, Topics, replay_source, result_sink
 from normalization import (
-    HOUSEKEEPING, MARKET_ZONES, PRICE, QUOTE, REJECTED, classify_row, parse_subscriptions,
+    HOUSEKEEPING, MARKET_ZONES, PRICE, QUOTE, REJECTED, WINDOW_MS,
+    classify_row, parse_subscriptions, window_end_ms,
 )
 
 BUNDLED_CONNECTOR = Path(__file__).with_name("jars") / "flink-sql-connector-kafka-3.3.0-1.20.jar"
+DEFAULT_LATENESS_SECONDS = 1.0
 
 DIAGNOSTIC_CAP = 20
 DIAGNOSTIC_FIELDS = {
@@ -177,6 +175,8 @@ class PriceWindows(KeyedProcessFunction):
         self.open_windows.put(end, (trade_us, source_index, source_row, close, source_file))
 
     def on_timer(self, timestamp, ctx):
+        from python_calculations import calculate_ema, detect_crossover, window_iso
+
         trade_us, source_index, source_row, close, source_file = self.open_windows.get(timestamp)
         self.open_windows.remove(timestamp)
         previous38, previous100 = self.ema.value() or (0.0, 0.0)
@@ -245,6 +245,12 @@ def build_pipeline(env, args):
     prices.get_side_output(DIAGNOSTICS).union(results.get_side_output(DIAGNOSTICS)).sink_to(
         sink(topics.diagnostics)
     ).name("diagnostics-kafka-sink")
+
+
+def lateness_ms(seconds):
+    if not math.isfinite(seconds) or not 0 <= seconds <= 86_400:
+        raise ValueError("--lateness-seconds must be between 0 and 86400")
+    return math.ceil(seconds * 1000)
 
 
 def parse_args():

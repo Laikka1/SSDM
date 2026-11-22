@@ -1,4 +1,4 @@
-"""Trading record normalization, classification, and symbol subscriptions."""
+"""Trading record normalization, classification, subscriptions, and window boundaries."""
 
 from datetime import datetime, time
 from functools import lru_cache
@@ -20,6 +20,13 @@ REJECTED = "rejected"
 TERMINAL_CLASSES = ("price_accepted", "price_late", QUOTE, HOUSEKEEPING, REJECTED)
 CLOCK_RE = re.compile(r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?")
 MARKET_ZONES = {exchange: ZoneInfo(zone) for exchange, zone in EXCHANGE_TIMEZONES.items()}
+WINDOW_MS = 5 * 60 * 1000
+
+
+def window_end_ms(trade_us: int) -> int:
+    # FR, NL and ETR market offsets are whole multiples of five minutes for
+    # the dataset. Their local midnight is on this UTC epoch grid in CET/CEST.
+    return (trade_us // 1000 // WINDOW_MS + 1) * WINDOW_MS
 
 
 def normalize_symbol(value: str) -> str:

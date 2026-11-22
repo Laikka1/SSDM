@@ -13,10 +13,9 @@ import time
 
 import psutil
 
-from calculations import WINDOW_MS, window_end_ms
 from inspect_run import process_usage, replay_clock_id
 from kafka_io import DEFAULT_PREFIX, INPUT_PARTITIONS, Topics, create_producer, enqueue, verify_topics
-from normalization import PRICE, classify_row, project_row
+from normalization import PRICE, WINDOW_MS, classify_row, project_row, window_end_ms
 
 REQUIRED_FIELDS = {"SecType", "Date", "Time", "Last", "Ask", "Bid", "Trading date", "Trading time"}
 INITIAL_PROGRESS_MS = 1  # Kafka clients use a zero timestamp to mean wall-clock time.

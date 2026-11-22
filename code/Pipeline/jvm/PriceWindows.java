@@ -27,7 +27,7 @@ import org.apache.flink.types.Row;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.OutputTag;
 
-/** Maintains each symbol's window closes and EMAs in Flink's JVM keyed state. */
+/** Computes window closes, EMAs, and crossovers for each symbol in Flink's JVM. */
 public final class PriceWindows extends KeyedProcessFunction<String, Row, String> {
     private static final long WINDOW_MS = 300_000;
     private static final Map<String, ZoneId> ZONES = Map.of(
@@ -135,6 +135,8 @@ public final class PriceWindows extends KeyedProcessFunction<String, Row, String
         double fast = ema(close, previous38, 38);
         double slow = ema(close, previous100, 100);
         previousEmas.update(Tuple2.of(fast, slow));
+        boolean bullishCrossover = previous38 <= previous100 && fast > slow;
+        boolean bearishCrossover = previous38 >= previous100 && fast < slow;
         completed.inc();
 
         String symbol = context.getCurrentKey();
@@ -153,9 +155,9 @@ public final class PriceWindows extends KeyedProcessFunction<String, Row, String
         output.collect(result.deepCopy().put("kind", "ema").put("result_id", id + ":ema")
                 .put("trade_us", tradeUs).put("source_index", sourceIndex)
                 .put("source_row", sourceRow).put("source_file", sourceFile).toString());
-        if (previous38 <= previous100 && fast > slow) {
+        if (bullishCrossover) {
             advice(context, result, id + ":buy", "BUY", "bullish_crossover", previous38, previous100);
-        } else if (previous38 >= previous100 && fast < slow) {
+        } else if (bearishCrossover) {
             advice(context, result, id + ":sell", "SELL", "bearish_crossover", previous38, previous100);
         }
     }
