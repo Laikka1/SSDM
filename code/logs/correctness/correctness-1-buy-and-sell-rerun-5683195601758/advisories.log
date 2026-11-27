@@ -1,0 +1,2 @@
+2026-11-25T09:21:40.866+02:00 offset=0  type=BUY  symbol=DEMO.FR  window_end=2021-11-08T08:05:00+01:00  close=100.0  EMA38=5.128205128205128  EMA100=1.9801980198019802  previous_EMA38=0.0  previous_EMA100=0.0  reason=bullish_crossover  window_to_visible_seconds=0.906
+2026-11-25T09:21:41.060+02:00 offset=1  type=SELL  symbol=DEMO.FR  window_end=2021-11-08T10:35:00+01:00  close=0.01  EMA38=1.0649483539527593  EMA100=1.091245972243426  previous_EMA38=1.1219725893015573  previous_EMA100=1.1130893252180407  reason=bearish_crossover  window_to_visible_seconds=0.351

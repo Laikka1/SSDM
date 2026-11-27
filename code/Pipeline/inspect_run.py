@@ -3,12 +3,13 @@
 from bisect import bisect_left
 from collections import Counter, deque
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import fcntl
+from http.client import HTTPException
 import json
 from pathlib import Path
 import re
 import time
-from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -20,9 +21,13 @@ from kafka_io import BROKER, INPUT_PARTITIONS, result_consumer
 from normalization import MARKET_ZONES, TERMINAL_CLASSES
 
 REST_PORT = 8082
+METRICS_PORT = 9249
+METRICS_URL = f"http://127.0.0.1:{METRICS_PORT}/metrics"
+WINDOW_OPERATOR = "price-windows-ema-crossover"
 EXCHANGE_COUNTS = tuple(f"price_accepted_{exchange}" for exchange in MARKET_ZONES)
 PROGRESS_COUNTS = (*TERMINAL_CLASSES, *EXCHANGE_COUNTS, "missing_trading_date_fallbacks")
 LOGGED_COUNTERS = {*PROGRESS_COUNTS, "raw_received", "price_windows_completed"}
+METRIC_LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 FAILED_STATES = {"CANCELED", "CANCELLING", "FAILED", "SUSPENDED"}
 UNAVAILABLE = "unavailable"
 METRIC_REQUEST_LIMIT = 3000
@@ -55,6 +60,64 @@ def clean(value):
 
 def fields(data):
     return "  ".join(f"{name}={clean(value)}" for name, value in data.items())
+
+
+class LiveMetrics:
+    def __init__(self, job_id, topic, parallelism):
+        self.job_id = job_id
+        self.topic = topic
+        self.subtasks = {str(subtask) for subtask in range(parallelism)}
+
+    def sample(self):
+        with urlopen(METRICS_URL, timeout=2) as response:
+            return self.parse(response.read().decode("utf-8").splitlines())
+
+    def parse(self, lines):
+        offsets, counts, watermarks = {}, {}, {}
+        duplicates = set()
+        for line in lines:
+            if line.startswith("#"):
+                continue
+            name, _, sample = line.partition("{")
+            counter = name.rpartition("_trading_")[2]
+            is_offset = name.endswith("_currentOffset")
+            is_watermark = name.endswith("_currentOutputWatermark")
+            if not (is_offset or is_watermark or counter in LOGGED_COUNTERS):
+                continue
+            labels_text, end, value_text = sample.rpartition("}")
+            if not end:
+                continue
+            labels = dict(METRIC_LABEL.findall(labels_text))
+            subtask = labels.get("subtask_index")
+            if labels.get("job_id") != self.job_id or subtask not in self.subtasks:
+                continue
+            try:
+                value = Decimal(value_text.strip())
+                if not value.is_finite() or value != value.to_integral_value() or abs(value) > 10**19:
+                    continue
+                value = int(value)
+            except InvalidOperation:
+                continue
+            if is_offset:
+                partition = labels.get("partition", "")
+                if labels.get("topic") != self.topic or not partition.isdecimal() or value < -1:
+                    continue
+                partition = int(partition)
+                if partition in offsets:
+                    duplicates.add(partition)
+                if partition in range(INPUT_PARTITIONS):
+                    # The gauge records the last emitted record. Kafka end offsets are exclusive.
+                    offsets[partition] = value + 1
+            elif is_watermark:
+                if labels.get("operator_name") == WINDOW_OPERATOR:
+                    watermarks[subtask] = value
+            else:
+                counts.setdefault(counter, {})[subtask] = value
+
+        offsets = {partition: offset for partition, offset in offsets.items() if partition not in duplicates}
+        totals = {name: sum(values.values()) for name, values in counts.items() if values.keys() == self.subtasks}
+        watermark = min(watermarks.values()) if watermarks.keys() == self.subtasks else None
+        return offsets, totals, watermark
 
 
 class BacklogAge:
@@ -255,56 +318,46 @@ class Flink:
         if batch:
             yield from self.get(path, get=",".join(batch))
 
-    def metrics(self, job):
-        offsets, watermarks = {}, {}
-        counts = Counter()
-        window_parallelism = 0
+    def cached_offsets(self, job):
+        offsets = {}
         for vertex in job["vertices"]:
-            name = vertex["name"]
-            is_window = name.startswith("price-windows-ema-crossover")
-            if is_window:
-                window_parallelism = vertex["parallelism"]
-            elif "kafka-replay-source" not in name and "decode-classify" not in name:
+            if "kafka-replay-source" not in vertex["name"]:
                 continue
-
             path = f"/jobs/{self.job_id}/vertices/{vertex['id']}/metrics"
-            ids = [item["id"] for item in self.get(path)]
-            wanted = [
-                key for key in ids
-                if (".trading." in key and key.rsplit(".", 1)[1] in LOGGED_COUNTERS)
-                or self.partition_metric.search(key)
-                or (is_window and key.endswith(".currentOutputWatermark"))
-            ]
+            wanted = [item["id"] for item in self.get(path) if self.partition_metric.search(item["id"])]
             for metric in self.metric_samples(path, wanted):
-                key = metric["id"]
+                partition = self.partition_metric.search(metric["id"])
+                if partition is None:
+                    continue
                 try:
-                    value = int(metric["value"])
+                    offsets[int(partition[1])] = int(metric["value"]) + 1
                 except (TypeError, ValueError):
                     continue
-                partition = self.partition_metric.search(key)
-                if partition:
-                    offsets[int(partition[1])] = value + 1
-                elif ".trading." in key:
-                    counts[key.rsplit(".", 1)[1]] += value
-                else:
-                    subtask = int(key.split(".", 1)[0])
-                    if key.count(".") == 1 or ".price-windows-ema-crossover." in key:
-                        watermarks[subtask] = max(watermarks.get(subtask, value), value)
-
-        watermark = min(watermarks.values()) if window_parallelism and len(watermarks) == window_parallelism else None
-        return offsets, counts, watermark
+        return offsets
 
 
-def progress_fields(offsets, ends, counts, watermark, observed, lag_seconds):
+def partition_values(offsets):
+    return ",".join(str(offsets.get(p, UNAVAILABLE)) for p in range(INPUT_PARTITIONS))
+
+
+def progress_fields(offsets, ends, counts, watermark, observed, lag_seconds, lag_reason):
     lag = {p: ends[p] - offset for p, offset in offsets.items() if p in ends}
-    lag_available = len(lag) == INPUT_PARTITIONS and min(lag.values()) >= 0
-    total = sum(lag.values()) if lag_available else None
+    if lag_reason is None:
+        if len(offsets) != INPUT_PARTITIONS:
+            lag_reason = "flink_partitions_missing"
+        elif len(ends) != INPUT_PARTITIONS:
+            lag_reason = "kafka_partitions_missing"
+        elif min(lag.values()) < 0:
+            lag_reason = "offsets_out_of_order"
+    total = sum(lag.values()) if lag_reason is None else None
     busiest = min(lag, key=lambda p: (-lag[p], p)) if total else None
     return {
         "partitions": f"{len(offsets)}/{INPUT_PARTITIONS}",
-        "partition_offsets": ",".join(str(offsets.get(p, UNAVAILABLE)) for p in range(INPUT_PARTITIONS)),
+        "partition_offsets": partition_values(offsets),
+        "kafka_end_offsets": partition_values(ends),
         "lag_records": total if total is not None else UNAVAILABLE,
         "lag_seconds": round(lag_seconds, 3) if total is not None and lag_seconds is not None else UNAVAILABLE,
+        "lag_reason": lag_reason or "none",
         "busiest_partition": (
             f"{busiest} ({lag[busiest]} records)" if busiest is not None
             else "none" if total == 0 else UNAVAILABLE
@@ -330,8 +383,15 @@ class ProgressSampler:
             for partition in range(INPUT_PARTITIONS)
         }
 
-    def sample(self, flink, job, results):
-        offsets, counts, watermark = flink.metrics(job)
+    def sample(self, metrics, results):
+        lag_reason = None
+        try:
+            offsets, counts, watermark = metrics.sample()
+        except (OSError, HTTPException, UnicodeError) as exc:
+            offsets, counts, watermark = {}, {}, None
+            lag_reason = "flink_metrics_unavailable"
+            results.log("FLINK_METRICS_UNAVAILABLE", error=exc)
+        flink_sample_ns = time.monotonic_ns()
         try:
             ends = {
                 tp.partition: result.result(timeout=3).offset
@@ -341,17 +401,19 @@ class ProgressSampler:
             # A new client discovers current leaders after a broker epoch change.
             self.admin = AdminClient(self.admin_config)
             ends = {}
+            lag_reason = lag_reason or "kafka_offsets_unavailable"
             results.log("KAFKA_OFFSETS_UNAVAILABLE", error=exc)
-        lag_seconds = self.backlog.sample(offsets, ends, time.monotonic())
-        sample = progress_fields(offsets, ends, counts, watermark, results.counts, lag_seconds)
-        complete = len(offsets) == len(ends) == INPUT_PARTITIONS
-        return sample, complete
+        kafka_sample_ns = time.monotonic_ns()
+        lag_seconds = self.backlog.sample(offsets, ends, kafka_sample_ns / 1e9)
+        sample = progress_fields(offsets, ends, counts, watermark, results.counts, lag_seconds, lag_reason)
+        return dict(sample, monotonic_ns=flink_sample_ns, kafka_sample_ns=kafka_sample_ns)
 
 
 def monitor(args, client, results):
     topics = args.topics
     log = results.log
     flink = Flink(str(client.get_job_id()), topics.input)
+    metrics = LiveMetrics(flink.job_id, topics.input, args.parallelism)
     completion = client.get_job_execution_result()
     progress = ProgressSampler(topics.input)
     consumer = result_consumer()
@@ -360,7 +422,7 @@ def monitor(args, client, results):
     timeout_reported = False
     next_sample = started
     ready = False
-    log("WAITING", prefix=topics.input, flink_rest=flink.base_url, broker=BROKER,
+    log("WAITING", prefix=topics.input, flink_rest=flink.base_url, flink_metrics=METRICS_URL, broker=BROKER,
         monitor_start_ns=round(started * 1e9))
 
     try:
@@ -379,6 +441,8 @@ def monitor(args, client, results):
                 completion.result()  # Surface task failures even after the local REST server exits.
                 break
             results.sample_resources()
+            job = None
+            state = UNAVAILABLE
             try:
                 job = flink.get(f"/jobs/{flink.job_id}")
                 state = job["state"]
@@ -387,16 +451,25 @@ def monitor(args, client, results):
                 if state in FAILED_STATES:
                     log("FAILED", job_id=flink.job_id, state=state, error=flink.failure())
                     return 1
-                sample, complete = progress.sample(flink, job, results)
-                if state == "RUNNING" and complete:
-                    last_complete_sample = time.monotonic()
-                    timeout_reported = False
-                    if not ready:
-                        log("READY", job_id=flink.job_id, prefix=topics.input, partitions=INPUT_PARTITIONS)
-                        ready = True
-                log("PROGRESS", state=state, **sample, elapsed_seconds=round(time.monotonic() - started, 3))
-            except (URLError, TimeoutError, KafkaException) as exc:
-                log("UNAVAILABLE", lag_records=UNAVAILABLE, lag_seconds=UNAVAILABLE, error=exc)
+            except (OSError, HTTPException, ValueError) as exc:
+                log("FLINK_STATE_UNAVAILABLE", error=exc)
+
+            sample = progress.sample(metrics, results)
+            if sample["lag_records"] != UNAVAILABLE:
+                last_complete_sample = time.monotonic()
+                timeout_reported = False
+                if state == "RUNNING" and not ready:
+                    log("READY", job_id=flink.job_id, prefix=topics.input, partitions=INPUT_PARTITIONS)
+                    ready = True
+            log("PROGRESS", state=state, **sample, elapsed_seconds=round(time.monotonic() - started, 3))
+
+            if args.compare_rest_metrics and job is not None:
+                try:
+                    cached = flink.cached_offsets(job)
+                    log("REST_METRICS", partition_offsets=partition_values(cached),
+                        monotonic_ns=time.monotonic_ns(), live_sample_ns=sample["monotonic_ns"])
+                except (OSError, HTTPException, ValueError) as exc:
+                    log("REST_METRICS_UNAVAILABLE", error=exc)
 
             if not timeout_reported and time.monotonic() - last_complete_sample >= args.timeout:
                 reason = "progress metrics unavailable" if ready else "waiting for all input partitions"

@@ -118,7 +118,7 @@ when the command prints `Replay prefix`.
   cd /home/jerry/SSDM
   source .venv311/bin/activate
   PREFIX="trading-events-$(date +%Y%m%d-%H%M%S-%N)"
-  DELAY=1
+  DELAY=5
   mkdir -p code/logs
   KAFKA_BROKER_SESSION_TIMEOUT_MS=240000 docker compose \
     --file code/docker-compose.yml \
@@ -164,6 +164,26 @@ python code/Pipeline/producer.py \
   --rate 20000 \
   --topic-prefix "$PREFIX"
 ```
+
+### Read the logs
+
+`worker.log` reports live Flink source offsets from the local metrics endpoint
+on port 9249 alongside Kafka end offsets for all eight partitions. `lag_records`
+counts Kafka records, including progress markers. `lag_seconds` estimates the
+age of the oldest unread Kafka record. Check `lag_reason` when `lag_records`
+is `unavailable`. Add `--compare-rest-metrics` to the worker command for a short
+diagnostic run. It adds `REST_METRICS` lines with the corresponding
+`live_sample_ns` so you can compare the cached and live offsets.
+
+Repeat the high-rate run with a fresh topic prefix at each of `--rate 20000`,
+`--rate 25000`, and `--rate 30000`. Use `--parallelism 4` and eight Kafka input
+partitions for every run. Keep the input slice, subscriptions, and Kafka
+settings fixed. Compare the change in producer
+`raw_acked` with the change in worker `raw_read` over the same `monotonic_ns`
+intervals. During replay, check for a growing lag trend and compare the p95
+`window_to_visible_seconds` in `ema.log` with your latency target. After replay
+finishes, wait for `lag_records=0` and `raw_read` to match the producer's final
+`raw_acked`. Repeat near the highest rate that meets those conditions.
 
 ## More replay test cases
 
@@ -266,7 +286,7 @@ Continue when the command prints `Kafka topics ready`.
 cd /home/jerry/SSDM
 source .venv311/bin/activate
 PREFIX="trading-events-$(date +%Y%m%d-%H%M%S-%N)"
-DELAY=10
+DELAY=5
 mkdir -p code/logs &&
   KAFKA_BROKER_SESSION_TIMEOUT_MS=240000 docker compose \
     --file code/docker-compose.yml up --detach --wait kafka &&
@@ -284,7 +304,8 @@ PYTHONPATH="$PWD/code/Pipeline" python code/Pipeline/streamworker.py \
   --topic-prefix "$PREFIX" --lateness-seconds "$DELAY" \
   --parallelism 4 --jvm-windows --interval 5 --timeout 600 \
   --kafka-request-timeout-ms 240000 \
-  --subscribed-symbols I3PLU.FR,IAMDS.FR,ITSL3.NL,ALE15.FR,A2QP7J.ETR,I3SHP.NL,ALCYB.FR,IAMZS.FR,I2STS.NL,A2PLUG.ETR,GV.FR,ALGAU.FR,A14U78.ETR,620200.ETR
+  --subscribed-symbols 620200.ETR,A14U78.ETR,A2PLUG.ETR,A2QP7J.ETR,ALCYB.FR,ALE15.FR,ALGAU.FR,GV.FR,I2STS.NL,I3PLU.FR,I3SHP.NL,IAMDS.FR,IAMZS.FR,ITSL3.NL
+
 ```
 
 ### Terminal 3 · Run the producer after the worker prints `READY`
@@ -294,11 +315,11 @@ cd /home/jerry/SSDM
 source .venv311/bin/activate
 source code/logs/current-run.env
 python code/Pipeline/producer.py \
-  --files data/debs2022-gc-trading-day-{08..14}-11-21.csv \
-  --rate 20000 \
+  --files data/debs2022-gc-trading-day-{08..10}-11-21.csv \
+  --rate 40000 \
   --topic-prefix "$PREFIX" \
-  --skip-rows 2000000 \
-  --max-rows 5000000
+  --skip-rows 150000 \
+  --max-rows 2000000
 ```
 
 ### Full-week endurance (evaluation Test 7)
@@ -315,86 +336,3 @@ python code/Pipeline/producer.py \
   --files data/debs2022-gc-trading-day-{08..14}-11-21.csv \
   --rate "$RATE" --topic-prefix "$PREFIX"
 ```
-
-## Publish additional batches
-
-Leave the worker running after the producer exits so it can log through drain.
-Run the producer again with the next tick file or row slice and the same
-`PREFIX`. The worker retains its holdback setting. Open windows wait for later ticks to advance event
-time. Use a fresh prefix to replay older data with fresh EMA state and a
-fresh watermark. Stop the worker with Ctrl+C when you are done.
-
-## JVM window operator
-
-The JVM option keeps CSV normalization and classification in Python and
-runs the partitioning by symbol, window state, timers, EMAs and crossovers
-in Flink's JVM. `--jvm-windows` builds the operator with JDK 17 into a temporary
-JAR and cleans it up on normal exit or Ctrl+C. For the PyFlink comparison in Test 8, omit
-`--jvm-windows` and use the same parallelism and CPU allocation in both runs.
-
-The 240-second Kafka timeouts in the high-rate replay tolerate the roughly 200-second
-wall-clock jumps observed on the WSL host. Longer timeouts also delay
-detection of genuine connection failures. Flink REST snapshots can still
-lag after a clock step.
-
-## Checkpoint recovery test
-
-Prepare a fresh prefix and start the worker below. Run the producer after `READY`. This mode
-uses automatic Flink task recovery with checkpoints and transactional Kafka
-sinks and keeps consuming as more batches arrive.
-
-```bash
-source .venv311/bin/activate
-source code/logs/current-run.env
-_python_worker_execution_mode=process PYTHONPATH="$PWD/code/Pipeline" \
-  python code/Pipeline/streamworker.py \
-  --topic-prefix "$PREFIX" \
-  --parallelism 4 \
-  --lateness-seconds "$DELAY" \
-  --subscribed-symbols INCAC.FR,INEUN.NL \
-  --jvm-windows \
-  --checkpoint-dir "$PWD/code/logs/$PREFIX/checkpoints"
-```
-
-For a recovery drill, stop one Python task process after a completed
-checkpoint appears in the Flink UI. Keep the Flink job and Kafka running
-and let Flink restore the task. The environment variable runs Python task
-executors in separate processes so the drill can stop one executor without
-stopping the job.
-
-## Read the logs
-
-cd /home/jerry/SSDM
-source code/logs/current-run.env
-tail -F "code/logs/$PREFIX/"{ema,advisories,worker}.log
-```
-
-For Test 6, subtract successive `partition_offsets` to measure records read on
-each partition, including progress markers. `busiest_partition` identifies the
-largest backlog at that instant. For CPU utilization, divide the change in CPU
-seconds by the elapsed monotonic seconds and multiply by 100 (one core is 100%).
-Match process samples by PID and creation time. RSS includes shared pages in
-each process. For Test 4, prefix the worker command with e.g. `taskset -c 0,1`
-and set `--parallelism 2` for a two-core run. Choose CPU IDs available to WSL
-and save the allocation for each run.
-
-For evaluation runs, sample Kafka alongside the worker and producer. Start this
-in Terminal 1 after Kafka is up and the worker has created the run directory.
-Stop with Ctrl+C after drain.
-
-```bash
-cd /home/jerry/SSDM
-source code/logs/current-run.env
-KAFKA_ID=$(docker compose --file code/docker-compose.yml ps -q kafka)
-while sample=$(docker stats --no-stream --format '{{.CPUPerc}} {{.MemUsage}}' "$KAFKA_ID"); do
-  printf '%s %s\n' "$(date --iso-8601=seconds)" "$sample"
-  sleep 2
-done >> "code/logs/$PREFIX/kafka-resources.log"
-```
-
-If a run fails, check `worker.log`, the JVM logs, and the Flink UI.
-An `IllegalArgumentException` at `SubTaskInitializationMetrics` line 49
-means the clock moved backward during Flink startup. If it keeps
-happening under WSL, finish any work in your WSL distributions and run
-`wsl --shutdown` from PowerShell. This stops all running distributions.
-Reopen Ubuntu and start again at Terminal 1 with a fresh prefix.

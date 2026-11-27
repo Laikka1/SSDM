@@ -1,0 +1,5 @@
+{"event": "replay_started", "topic": "correctness-2B-subscription-filter-rerun-5500943509328", "target_rows_s": 20.0, "files": ["/home/jerry/SSDM/code/correctness/windows.csv"], "skip_rows": 0, "max_rows": null, "monotonic_ns": 5511564796677, "pid": 121731, "name": "python", "created": 1795591134.39, "cpu_seconds": 0.09, "rss_bytes": 33611776, "raw_queued": 0, "raw_acked": 0, "markers_queued": 0, "markers_acked": 0, "failed": 0}
+{"event": "window_frontier", "window_end_ms": 1636358700000, "monotonic_ns": 5511666237579, "clock_id": "1ee2e649-4501-468e-8ea3-e6d28964a3d9"}
+{"event": "window_frontier", "window_end_ms": 1636359000000, "monotonic_ns": 5511766309677, "clock_id": "1ee2e649-4501-468e-8ea3-e6d28964a3d9"}
+{"event": "window_frontier", "window_end_ms": 1636359300000, "monotonic_ns": 5512068160258, "clock_id": "1ee2e649-4501-468e-8ea3-e6d28964a3d9"}
+{"event": "replay_finished", "elapsed_seconds": 5.604, "monotonic_ns": 5517168711490, "pid": 121731, "name": "python", "created": 1795591134.39, "cpu_seconds": 0.1, "rss_bytes": 34136064, "raw_queued": 10, "raw_acked": 10, "markers_queued": 32, "markers_acked": 32, "failed": 0}

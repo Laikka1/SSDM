@@ -1,0 +1,3 @@
+2026-11-25T09:18:34.754+02:00 offset=0  type=EMA  symbol=DEMO.FR  window_end=2021-11-08T09:10:00+01:00  close=112.0  EMA38=5.743589743589744  EMA100=2.217821782178218  source_file=windows.csv  source_row=5  window_to_visible_seconds=5.805
+2026-11-25T09:18:34.754+02:00 offset=1  type=EMA  symbol=OTHER.NL  window_end=2021-11-08T09:15:00+01:00  close=200.0  EMA38=10.256410256410255  EMA100=3.9603960396039604  source_file=windows.csv  source_row=6  window_to_visible_seconds=5.506
+2026-11-25T09:18:34.754+02:00 offset=2  type=EMA  symbol=DEMO.FR  window_end=2021-11-08T09:15:00+01:00  close=120.0  EMA38=11.602892833662064  EMA100=4.5501421429271645  source_file=windows.csv  source_row=3  window_to_visible_seconds=5.506

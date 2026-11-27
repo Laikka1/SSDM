@@ -21,7 +21,7 @@ from pyflink.datastream.functions import KeyedProcessFunction, ProcessFunction
 from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
 from pyflink.java_gateway import get_gateway
 
-from inspect_run import REST_PORT, ResultLogs, monitor
+from inspect_run import LOGGED_COUNTERS, METRICS_PORT, REST_PORT, WINDOW_OPERATOR, ResultLogs, monitor
 from kafka_io import BROKER, DEFAULT_PREFIX, INPUT_PARTITIONS, Topics, replay_source, result_sink
 from normalization import (
     HOUSEKEEPING, MARKET_ZONES, PRICE, QUOTE, REJECTED, WINDOW_MS,
@@ -238,7 +238,7 @@ def build_pipeline(env, args):
         results = DataStream(gateway.jvm.ssdm.PriceWindows.apply(
             prices._j_data_stream, topics.input, subscriptions, DIAGNOSTIC_CAP,
         ))
-    results.name("price-windows-ema-crossover")
+    results.name(WINDOW_OPERATOR)
 
     results.sink_to(sink(topics.windows)).name("ema-kafka-sink")
     results.get_side_output(ADVISORIES).sink_to(sink(topics.advisories)).name("advisory-kafka-sink")
@@ -263,6 +263,7 @@ def parse_args():
     parser.add_argument("--jvm-windows", action="store_true", help="Build and use the JVM window operator")
     parser.add_argument("--kafka-request-timeout-ms", type=int, help="Override the worker's Kafka request timeout")
     parser.add_argument("--interval", type=float, default=2, help="Seconds between progress reports")
+    parser.add_argument("--compare-rest-metrics", action="store_true", help="Also log cached Flink REST offsets for comparison")
     parser.add_argument("--timeout", type=float, default=90, help="Seconds before reporting unavailable progress metrics")
     args = parser.parse_args()
     if not 1 <= args.parallelism <= INPUT_PARTITIONS:
@@ -287,12 +288,35 @@ def build_jvm_window_jar(output: Path):
         subprocess.run(["jar", "--create", "--file", str(output), "-C", classes, "."], check=True)
 
 
+def make_reporter_available(stack):
+    # PyFlink's embedded MiniCluster discovers reporter factories on the gateway classpath.
+    flink_home = Path(os.environ.setdefault("FLINK_HOME", str(Path(pyflink.__file__).parent)))
+    libraries = Path(os.environ.get("FLINK_LIB_DIR", flink_home / "lib"))
+    plugins = Path(os.environ.get("FLINK_PLUGINS_DIR", flink_home / "plugins"))
+    reporters = list((plugins / "metrics-prometheus").glob("flink-metrics-prometheus-*.jar"))
+    if len(reporters) != 1:
+        raise RuntimeError(f"Expected one Prometheus reporter jar under {plugins / 'metrics-prometheus'}")
+    reporter = reporters[0]
+    gateway_lib = Path(stack.enter_context(TemporaryDirectory(prefix="ssdm-flink-lib-")))
+    for library in libraries.glob("*.jar"):
+        if library.name != reporter.name:
+            (gateway_lib / library.name).symlink_to(library.resolve())
+    (gateway_lib / reporter.name).symlink_to(reporter.resolve())
+    os.environ["FLINK_LIB_DIR"] = str(gateway_lib)
+
+
 def submit(args, stack):
+    make_reporter_available(stack)
     config = Configuration()
     config.set_integer("rest.port", REST_PORT)
     config.set_string("rest.bind-port", str(REST_PORT))
     config.set_string("rest.bind-address", "127.0.0.1")
     config.set_string("metrics.fetcher.update-interval", "1 s")
+    config.set_string("metrics.reporter.prom.factory.class", "org.apache.flink.metrics.prometheus.PrometheusReporterFactory")
+    config.set_string("metrics.reporter.prom.port", str(METRICS_PORT))
+    config.set_boolean("metrics.reporter.prom.filterLabelValueCharacters", False)
+    reported_metrics = ",".join(sorted(LOGGED_COUNTERS | {"currentOffset", "currentOutputWatermark"}))
+    config.set_string("metrics.reporter.prom.filter.includes", f"*:{reported_metrics}")
     config.set_integer("python.fn-execution.bundle.size", 1000)
     config.set_string("python.fn-execution.bundle.time", "100")
     env = StreamExecutionEnvironment.get_execution_environment(config)

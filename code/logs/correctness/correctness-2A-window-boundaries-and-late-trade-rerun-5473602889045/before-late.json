@@ -1,0 +1,36 @@
+{
+  "progress": {
+    "state": "RUNNING",
+    "partitions": "8/8",
+    "partition_offsets": "4,11,3,3,3,3,3,4",
+    "kafka_end_offsets": "4,11,3,3,3,3,3,4",
+    "lag_records": "0",
+    "lag_seconds": "0.0",
+    "lag_reason": "none",
+    "busiest_partition": "none",
+    "raw_read": "10",
+    "price_accepted": "7",
+    "price_late": "0",
+    "quote_only": "1",
+    "housekeeping_or_metadata": "1",
+    "rejected": "1",
+    "price_accepted_FR": "6",
+    "price_accepted_NL": "1",
+    "price_accepted_ETR": "0",
+    "missing_trading_date_fallbacks": "unavailable",
+    "price_windows": "3",
+    "ema": "3",
+    "buy": "2",
+    "sell": "0",
+    "window_watermark": "2021-11-08T08:15:58.999+00:00",
+    "monotonic_ns": "5491702271157",
+    "kafka_sample_ns": "5491703532648",
+    "elapsed_seconds": "12.205"
+  },
+  "output_end_offsets": {
+    "windows": 3,
+    "advisories": 2,
+    "diagnostics": 3
+  },
+  "fallback_counter_direct": 0
+}
